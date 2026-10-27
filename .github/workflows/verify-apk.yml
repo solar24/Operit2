@@ -1,0 +1,88 @@
+name: Verify Operit2 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  RUN_ID: "40457877966"
+  ART: operit2-android-b0ba12a85e1711b6e8df999893bec0fa64b4ed84
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download artifact from build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/art
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ART" --dir /tmp/art
+          find /tmp/art -type f -printf '%10s  %p\n'
+          ZIP=$(find /tmp/art -name '*.zip' | head -1)
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          sha256sum "$ZIP" | tee /tmp/sha.txt
+
+      - name: Unpack
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/apk
+          unzip -o "$ZIP" -d /tmp/apk > /dev/null
+          find /tmp/apk -maxdepth 3 -type f -printf '%10s  %p\n' | sort -k2
+          APK=$(find /tmp/apk -name '*.apk' | head -1)
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          echo "APK_PATH=$APK"
+
+      - name: "Check 1 - assets only arm64-v8a"
+        run: |
+          set -euo pipefail
+          unzip -l "$APK" | awk '{print $4}' | grep '^assets/android-runtime/' | sort > /tmp/a.txt || true
+          echo "--- assets/android-runtime entries ($(wc -l < /tmp/a.txt)) ---"
+          cat /tmp/a.txt
+          awk -F/ '{print $3}' /tmp/a.txt | grep -v '^$' | sort -u > /tmp/abis.txt || true
+          echo "--- ABI set ---"; cat /tmp/abis.txt
+          if [ "$(cat /tmp/abis.txt)" != "arm64-v8a" ]; then echo "FAIL: assets ABI set mismatch"; exit 1; fi
+          echo "PASS: assets contain only arm64-v8a"
+
+      - name: "Check 2 - native libs present"
+        run: |
+          set -euo pipefail
+          unzip -l "$APK" | awk '{print $4}' | grep '^lib/' | sort > /tmp/l.txt || true
+          echo "--- lib entries ---"; cat /tmp/l.txt
+          awk -F/ '{print $2}' /tmp/l.txt | grep -v '^$' | sort -u > /tmp/libabis.txt || true
+          echo "--- lib ABI set ---"; cat /tmp/libabis.txt
+          if [ "$(cat /tmp/libabis.txt)" != "arm64-v8a" ]; then echo "FAIL: lib ABI set mismatch"; exit 1; fi
+          for so in liboperit_flutter_bridge.so liboperit_proot.so libbash.so liboperit_busybox.so liboperit_loader.so; do
+            grep -qx "lib/arm64-v8a/$so" /tmp/l.txt || { echo "FAIL missing $so"; exit 1; }
+            echo "PASS $so"
+          done
+
+      - name: "Check 3 - aapt2 dump badging"
+        run: |
+          set -euo pipefail
+          AAPT2=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          echo "aapt2=$AAPT2"
+          "$AAPT2" dump badging "$APK" > /tmp/badging.txt
+          head -15 /tmp/badging.txt
+          grep -q "package: name='app.operit'" /tmp/badging.txt && echo "PASS package=app.operit" || { echo "FAIL package"; exit 1; }
+          grep -q "versionName='2.0.0'" /tmp/badging.txt && echo "PASS versionName=2.0.0" || { echo "FAIL versionName"; exit 1; }
+          grep -o "versionCode='[0-9]*'" /tmp/badging.txt | head -1
+          grep -o "native-code: .*" /tmp/badging.txt | head -1
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-verify-report
+          path: |
+            /tmp/badging.txt
+            /tmp/a.txt
+            /tmp/l.txt
+            /tmp/sha.txt
+          if-no-files-found: warn
+          retention-days: 7
