@@ -84,6 +84,12 @@ jobs:
           python -m venv .venv
           .\.venv\Scripts\python.exe -c "import sys; print('venv python', sys.version)"
 
+      - name: Provision TypeScript compiler
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          .\.ci-tools\typescript\node_modules\.bin\tsc.cmd --version
+
       - name: Download Android terminal runtime
         uses: actions/download-artifact@v4
         with:
