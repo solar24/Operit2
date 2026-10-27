@@ -1,0 +1,41 @@
+name: Plugin Sync Smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prep-smoke:
+    runs-on: windows-2025
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Create plugin sync virtualenv
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -c "import sys; print('venv python', sys.version)"
+
+      - name: Provision TypeScript compiler
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          .\.ci-tools\typescript\node_modules\.bin\tsc.cmd --version
+
+      - name: Run plugin sync (identical command to hook/build.dart)
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe plugins\tools\sync_plugin_packages.py --source runtime --no-hot-reload
+          if ($LASTEXITCODE -ne 0) { throw "plugin sync failed with exit $LASTEXITCODE" }
