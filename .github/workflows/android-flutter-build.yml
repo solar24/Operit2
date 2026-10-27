@@ -65,8 +65,72 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-android-v8:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install V8 build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            git \
+            libclang-dev \
+            libglib2.0-dev \
+            lld \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-venv \
+            unzip \
+            xz-utils \
+            zlib1g-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK 27.3.13750724
+        run: |
+          set -euo pipefail
+          ndk_dir="$ANDROID_HOME/ndk/27.3.13750724"
+          if [ ! -d "$ndk_dir" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.3.13750724"
+          fi
+          test -d "$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64"
+
+      - name: Build Android V8 from source
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
+          python3 tools/build_scripts/prepare_android_v8.py \
+            --target aarch64-linux-android \
+            --env-file /tmp/android-v8.env
+          cat /tmp/android-v8.env
+
+      - name: Upload Android V8 cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: tools/release/work/android-v8
+          if-no-files-found: error
+          retention-days: 1
+
   build-android:
-    needs: build-android-runtime
+    needs: [build-android-runtime, build-android-v8]
     runs-on: windows-2025
     timeout-minutes: 240
     env:
@@ -194,6 +258,12 @@ jobs:
         with:
           path: tools/release/work/android-v8
           key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Import Linux-built Android V8
+        uses: actions/download-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: tools/release/work/android-v8
 
       - name: Check build environment
         shell: pwsh
