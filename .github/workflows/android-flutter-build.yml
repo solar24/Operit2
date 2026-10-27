@@ -90,6 +90,13 @@ jobs:
           npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
           .\.ci-tools\typescript\node_modules\.bin\tsc.cmd --version
 
+      - name: Install built-in workflow plugin dependencies
+        shell: pwsh
+        run: |
+          Push-Location plugins/packages/buildin/workflow
+          corepack pnpm install --frozen-lockfile
+          Pop-Location
+
       - name: Download Android terminal runtime
         uses: actions/download-artifact@v4
         with:
