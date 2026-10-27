@@ -112,22 +112,14 @@ jobs:
           fi
           test -d "$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64"
 
-      - name: Install libclang 21.1.8 for bindgen
+      - name: Install libclang 21 for bindgen
         run: |
           set -euo pipefail
-          found=0
-          for tag in ubuntu-24.04 ubuntu-22.04; do
-            url="https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/clang+llvm-21.1.8-x86_64-linux-gnu-$tag.tar.xz"
-            echo "trying $url"
-            if curl -fsSL --retry 3 --retry-delay 5 -o /tmp/llvm21.tar.xz "$url"; then
-              found=1
-              break
-            fi
-          done
-          test "$found" = "1"
-          sudo mkdir -p /opt/llvm21
-          sudo tar -xJf /tmp/llvm21.tar.xz -C /opt/llvm21 --strip-components=1
-          real="$(readlink -f /opt/llvm21/lib/libclang.so)"
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y libclang-21-dev
+          real="$(readlink -f /usr/lib/llvm-21/lib/libclang.so)"
           test -f "$real"
           echo "libclang real path: $real"
           sudo mkdir -p /usr/lib/llvm21/lib
@@ -135,6 +127,7 @@ jobs:
             sudo ln -sf "$real" "/usr/lib/llvm21/lib/$alias"
           done
           ls -l /usr/lib/llvm21/lib
+          ls /usr/lib/llvm-21/lib/clang/ 2>/dev/null || true
           python3 -c "import ctypes; ctypes.CDLL('/usr/lib/llvm21/lib/libclang.so'); print('libclang loads')"
 
       - name: Build Android V8 from source
