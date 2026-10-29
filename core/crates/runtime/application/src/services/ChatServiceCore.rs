@@ -19,7 +19,7 @@ use crate::services::core::MessageProcessingDelegate::{
     ChatExecutionState, ChatTurnSubmission, MessageProcessingDelegate, SendUserMessageProcessingRequest,
 };
 use crate::services::core::TokenStatisticsDelegate::TokenStatisticsDelegate;
-use crate::services::ProviderRuntimeSupportService::ChatConfigurationApi;
+use crate::services::ProviderRuntimeSupportService::{ChatConfigurationApi, MODEL_CONFIGURATION_OWNER};
 use crate::services::RuntimeHostInteractionService::{
     chatToolPermissionRequestsFlow, respondChatToolPermission,
     RuntimeHostInteractionToolPermissionRequest,
@@ -567,6 +567,30 @@ impl ChatServiceCore {
         Ok(())
     }
 
+    /// Receives bounded UTF-8 chunks, then enters the existing turn pipeline.
+    /// An explicit empty commit chunk plus EOF is required; an interrupted
+    /// upload must never turn its received prefix into a chat message.
+    #[operit_route_macros::operit_core_route(binding = chatIdOverride)]
+    pub async fn sendUserMessageStream(
+        &mut self,
+        promptFunctionType: PromptFunctionType,
+        participantId: Option<String>,
+        chatIdOverride: Option<String>,
+        expectedByteLength: i64,
+        proxySenderNameOverride: Option<String>,
+        chatProviderIdOverride: Option<String>,
+        chatModelIdOverride: Option<String>,
+        attachments: Vec<AttachmentInfo>,
+        replyToMessage: Option<ChatMessage>,
+        turnOptions: ChatTurnOptions,
+        text: operit_util::stream::ReverseStream::ReverseStream<String>,
+    ) -> Result<(), String> {
+        let messageText = super::chat_input_stream::receive(text, expectedByteLength).await?;
+        self.sendUserMessage(promptFunctionType, participantId, chatIdOverride, messageText,
+            proxySenderNameOverride, chatProviderIdOverride, chatModelIdOverride,
+            attachments, replyToMessage, turnOptions).await
+    }
+
     /// Starts the actual originating generation or returns an explicit hook ownership decision for native receipt observers.
     pub(crate) async fn startUserMessage(
         &mut self,
@@ -798,13 +822,7 @@ impl ChatServiceCore {
             .chatHistoryManager
             .beginChatExecution(&chatId)
             .map_err(|error| error.to_string())?;
-        let api = ChatConfigurationApi::ready(&service.tool_handler).await?;
-        if api.extensionOwner() != resumeContext.extensionOwner {
-            return Err(
-                "Routed message configuration owner differs from the registered configuration owner"
-                    .to_string(),
-            );
-        }
+        let mut api = ChatConfigurationApi::ready(&service.tool_handler).await;
         let support = service.provider_runtime_context.support();
         let configuration = api
             .resolve(ChatConfigurationRequest {
@@ -1085,7 +1103,7 @@ impl ChatServiceCore {
             .enhancedAiService
             .as_ref()
             .ok_or_else(|| "Chat display requires an initialized plugin runtime".to_string())?;
-        let api=ChatConfigurationApi::ready(&service.tool_handler).await?;
+        let mut api=ChatConfigurationApi::ready(&service.tool_handler).await;
         let support=service.provider_runtime_context.support();
         let configuration=api.resolveDisplay(ChatConfigurationRequest {
             purpose: ChatConfigurationPurpose::Display,
@@ -1113,14 +1131,15 @@ impl ChatServiceCore {
         let service = self.enhancedAiService.as_ref().ok_or_else(|| {
             "Message configuration requires an initialized AI runtime".to_string()
         })?;
-        let api = ChatConfigurationApi::ready(&service.tool_handler).await?;
+        let mut api = ChatConfigurationApi::ready(&service.tool_handler).await;
         let target = operit_model::PluginExtensionTarget::PluginExtensionTarget::Message {
             chatId: chatId.clone(),
             messageTimestamp,
             variantIndex,
         };
         let extensions = self.chatHistoryDelegate.chatHistoryManager.readPluginExtensions(&target).map_err(|error| error.to_string())?;
-        let participantId = extensions.get(api.extensionOwner())
+        let participantId = extensions.get(MODEL_CONFIGURATION_OWNER)
+            .or_else(|| extensions.get(api.extensionOwner()))
             .and_then(|identity| identity.get("participantId"))
             .and_then(serde_json::Value::as_str)
             .filter(|id| !id.trim().is_empty())
@@ -1164,7 +1183,9 @@ impl ChatServiceCore {
             )
             .await
             .map_err(|error| error.to_string())?;
-        if configuration.profile.id != participantId {
+        if configuration.profile.id != participantId
+            && configuration.extensionOwner != MODEL_CONFIGURATION_OWNER
+        {
             return Err(
                 "Resolved profile does not match the requested execution participant".to_string(),
             );
@@ -2434,13 +2455,13 @@ impl ChatServiceCore {
     /// Paging uses the message index; it never transfers complete history or tool payloads.
     #[allow(non_snake_case)]
     #[operit_route_macros::operit_core_route(binding = chatId)]
-    pub async fn chatMessagesWindowFlow(&self, chatId: String, beforeTimestamp: Option<i64>, beforeTextOffset: Option<u32>, textBytes: u32, textLines: u32) -> StateFlow<operit_model::ChatDisplayWindowState::ChatDisplayWindow> {
+    pub async fn chatMessagesWindowFlow(&self, chatId: String, beforeTimestamp: Option<i64>, beforeTextOffset: Option<u32>, textBytes: u32, textLines: u32) -> StateFlow<operit_edge_contract::chat_display::ChatDisplayWindow> {
         let manager = self.chatHistoryDelegate.chatHistoryManager.clone();
         self.localChatMessagesFlow(chatId.clone()).map(move |live| {
             let messages = if let Some(timestamp) = beforeTimestamp {
                 let mut page = match manager.loadChatMessagesDescUpTo(chatId.clone(), timestamp, 14) {
                     Ok(page) => page,
-                    Err(error) => return operit_model::ChatDisplayWindowState::ChatDisplayWindow { messages:Vec::new(), older:None, error:Some(error.to_string()) },
+                    Err(error) => return operit_edge_contract::chat_display::ChatDisplayWindow { messages:Vec::new(), older:None, error:Some(error.to_string()) },
                 };
                 page.reverse(); page
             } else { live };

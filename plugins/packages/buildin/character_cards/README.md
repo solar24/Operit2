@@ -145,7 +145,7 @@ role command names and descriptions are supplied only by this package.
 The request path is:
 
 - UI, commands and public APIs enter `service-runtime.ts`, which opens one lazy service.
-- Reads go directly to `storage/database.ts`. Writes use `operations.ts` and the repository's serialized session.
+- Reads enter `storage/database.ts`. `operations.ts` routes configuration edits to preference snapshots and memory operations to `storage/memory-repository.ts`; HTTP calls hold no repository-wide queue.
 - Configuration records live in native JSON preferences; memories and jobs live in `memory.sqlite`. USER.md stays a file.
 - `drafts.ts:readCharacter` decodes persisted and imported cards with the same defaults as new cards. It returns a new value and preserves existing content.
 
@@ -167,7 +167,7 @@ groups, prompt tags, memory profiles, USER.md, memories, properties, document ch
 links, pending extraction tasks and declared memory preferences. Source Room schemas
 remain explicit; chat name/group bindings resolve to plugin selection markers before
 Core chat import. Historical message send profiles are not reconstructed. Derived
-binary embedding vectors are not imported into the plugin's endpoint/model/text cache.
+binary embedding vectors are not imported. Explicit rebuilds derive current source vectors using the configured provider.
 See `docs/migration-acceptance.md` and `docs/operit1-restore-boundary.md` for evidence.
 
 ## Ownership boundary
@@ -252,10 +252,11 @@ hits off. This recall replaces the memory item formerly offered by the extra
 information injection package.
 
 Retrieval always honors the owner's persisted search weights from the memory
-settings retrieval tab. When the cloud embedding provider is unconfigured, the
-semantic channel is skipped instead of failing the search, so keyword, tag and
-graph retrieval keep working regardless of the stored vector weight; provider
-failures on a configured endpoint still surface as search errors.
+settings retrieval tab. Disabling cloud embeddings explicitly selects lexical,
+tag and graph retrieval. Enabling embeddings requires a valid endpoint and model;
+provider errors and an incomplete or stale source-vector index fail the request.
+Changing providers or enabling embeddings on an existing library requires an
+explicit embedding rebuild.
 
 ## Owner memory controls
 
@@ -266,11 +267,20 @@ publishes settings plus search weights in one repository transaction; it preserv
 the scheduler's latest `nextAutoSaveRunAtMs` rather than overwriting it from a stale
 editor draft. Both character and shared-library rows open their exact owner.
 
-History rebuilds use the registered memory-job interval hook and persisted plans,
-not browser timers. The modal polls only genuine queue/progress values, without
-replacing editable fields, and stops polling on close without cancelling jobs.
+Memory candidates are produced on the device that actually persists a reply; receiving
+synchronized history does not create another extraction request. Each candidate records
+that producing CoreNode, and each device's ordinary interval processes only its own
+requests. History rebuilds likewise remain with the device on which they were requested.
+Restarting that device resumes its persisted work; another device never takes work merely
+because its producer is unreachable. Memory records and task provenance remain synchronized.
+Released tasks without producer metadata are reported as failed without calling a model;
+explicit retry assigns candidate work to the requesting device, and a new rebuild records
+its requesting device. One owner's failure does not stop independent owners or later intervals.
+The modal polls genuine queue/progress values without replacing editable fields, and stops
+polling on close without cancelling jobs.
 Embedding rebuilds use the saved endpoint/model/key and the existing HTTP capability;
-provider errors stay visible and leave the previous cache intact. The unnecessary
+provider errors stay visible. Rebuilds publish version-checked source pages; already
+committed pages remain committed when a later page fails. The unnecessary
 score-mode selector is omitted while its stored configuration is preserved.
 
 `tests/memory-controls-ui.test.mjs` exercises browser controls through registered
@@ -290,7 +300,7 @@ placeholder controls:
   without flags upgrades to its previously active behavior; malformed stored flags
   fail reads instead of guessing values. Provider prompt assembly trusts the plugin
   execution profile, not a second retired Core preference gate.
-- Retrieval debugging reuses the production RRF search and real provider embeddings.
+- Retrieval debugging reuses the production database search and real provider embeddings.
   Draft weights are not saved. Each candidate reports actual lexical/tag/vector/edge
   contributions and its threshold decision; normal retrieval filters the same results.
 - Graph export/import invokes the full owner backup codec, including records, document
@@ -309,8 +319,13 @@ scheduler orders candidates by source timestamp before applying its twenty-recor
 Kotlin remains the behavior reference, with explicit implementation differences:
 lexical expansion uses bounded Unicode terms and Han unigrams/bigrams rather than
 Jieba; imported document chunks also participate in node recall; vectors use the
-configured HTTP provider, exact-input cache and linear comparison rather than native
-indices. Failed jobs stay terminal without automatic retry. Merge removes source
+configured HTTP provider and exact database-side dot products over normalized source
+vectors. Source text and its vector occupy one synchronized, versioned row; query
+vectors are ephemeral. SQL applies owner/folder/time scope, scoring, graph expansion,
+snapshot exclusions and result limits before returning records. There is no retained
+TypeScript corpus or query-time construction of historical vectors. HTTP batches
+contain at most 64 inputs and use at most four concurrent workers. Failed jobs stay
+terminal without automatic retry. Merge removes source
 chunks and internal links that would become self-links under this domain's invariant.
 
 The browser/main-IPC suite covers these flows, failed writes, runtime reopening,
@@ -346,3 +361,24 @@ requires running the updated application.
 最后一个成员真实完成且原生发送清理结束后，Core 重新计算各参与者上下文窗口并检查摘要阈值，
 达到阈值时通过已有摘要任务执行一次摘要，不继续生成新回复。取消、发送失败和空计划不触发结束摘要。
 宿主只处理通用历史和摘要策略，群组计划仍由插件负责。
+
+The current vector engine uses SQLite JSON/window queries through the shared host.
+It performs exact scans within the selected scope; it has no ANN/HNSW index and no
+sqlite-vec extension. Query latency still includes the configured provider request.
+Explicit imports use independently atomic batches and may partially commit; USER.md,
+configuration preferences and the memory database have separate transaction boundaries.
+Backups export source records without the retired text cache; importing with embeddings
+enabled recomputes vectors. Synchronization carries existing vectors with their source
+row. Opening migrated libraries deletes retired cache rows without loading their payloads.
+
+### 记忆检索索引
+
+SQLite 保存同步的源记录及其 embedding，检索不再在 SQL 中展开向量 JSON、计算点积或执行多层排名 CTE。
+插件第一次读取某个 owner 时，以主键范围分页建立词项索引、标题索引、文件夹和时间索引、关系邻接表，以及 USearch WASM 近邻索引。
+运行中的后续查询读取本地变更游标，只更新发生变化的源；普通查询只对候选进行合分，最后按 key 读取结果页。
+文档块复用同一索引和分词规则。检索仅生成当前 query 的临时向量，源 embedding 的缺失、过期或维数变化仍要求显式重建。
+
+`vendor/usearch` 是本插件拥有的依赖及构建入口，与 `plugins/sdk` 的外部 IPC 客户端无关。
+ANN 是近似检索，文件夹、时间和排除条件传入 WASM 过滤器；候选预算有上限，避免文档大量分块时退化为全库精确扫描。
+词项和关系评分在 `src/memory-search.ts` 中实现，保留 RRF、权重模式、阈值和排除后的分页语义。
+索引当前保留在运行时内存中，冷启动会重建索引；WASM 保存／恢复能力已由独立示例验证，尚未接入记忆插件的磁盘检查点。

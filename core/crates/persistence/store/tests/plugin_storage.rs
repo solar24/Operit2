@@ -1478,3 +1478,122 @@ fn preference_references_do_not_block_independent_plugin_transactions() {
     source.dispose();
     target.dispose();
 }
+
+/// Queries synchronized source envelopes through the same parameterized CTE shape as memory retrieval.
+#[test]
+fn object_queries_rank_vectors_after_sync_replay() {
+    let first = Fixture::new("first");
+    let handle = first.open("objects");
+    first.call(json!({"op":"commit","handle":handle,"mutations":[
+        put("source", json!({"record":{"content":"source"},"embedding":{"vector":[1.0,0.0]}})),
+        put("other", json!({"record":{"content":"other"},"embedding":{"vector":[0.0,1.0]}}))
+    ]})).unwrap();
+    // SQLiteDialect rejects AS MATERIALIZED before SQLite sees the statement.
+    let sql = "WITH query_vector AS (SELECT CAST(key AS INTEGER) AS dimension,value FROM json_each(?1)) SELECT key,(SELECT sum(q.value*v.value) FROM json_each(o.value,'$.embedding.vector') v JOIN query_vector q ON q.dimension=v.key) AS score FROM plugin_objects o WHERE collection='keys' ORDER BY score DESC LIMIT 1";
+    let second = Fixture::new("second");
+    second.replay(&first.export());
+    let other = second.open("objects");
+    for (vector, expected) in [("[1.0,0.0]", "source"), ("[0.0,1.0]", "other")] {
+        let params = json!([{"kind":"text","value":vector}]);
+        let rows = first.call(json!({"op":"query","handle":handle,"statement":{"sql":sql,"params":params}})).unwrap();
+        assert_eq!(rows[0]["values"][0]["value"], expected);
+        assert_eq!(rows[0]["values"][1]["value"], 1.0);
+        assert_eq!(rows, second.call(json!({"op":"query","handle":other,"statement":{"sql":sql,"params":params}})).unwrap());
+    }
+    for statement in [
+        "SELECT * FROM _operit_log",
+        "DELETE FROM plugin_objects",
+        "SELECT * FROM sqlite_master",
+        "WITH hidden AS (SELECT * FROM _operit_log) SELECT * FROM hidden",
+        "WITH hidden AS (SELECT * FROM sqlite_master) SELECT * FROM hidden",
+        "WITH keys AS (SELECT key FROM plugin_objects) DELETE FROM plugin_objects WHERE key IN (SELECT key FROM keys)",
+    ] {
+        assert!(first.call(json!({"op":"query","handle":handle,"statement":{"sql":statement,"params":[]}})).is_err());
+    }
+    first.dispose(); second.dispose();
+}
+
+/// Rejects a source write when related owner metadata changed while the caller awaited a provider.
+#[test]
+fn object_record_guards_are_checked_before_source_publication() {
+    let f = Fixture::new("first");
+    let handle = f.open("objects");
+    f.call(json!({"op":"commit","handle":handle,"mutations":[put("owner",json!({"model":"old"}))]})).unwrap();
+    let version = f.get(&handle,"owner")["version"].clone();
+    f.call(json!({"op":"commit","handle":handle,"mutations":[put("owner",json!({"model":"new"}))]})).unwrap();
+    assert!(f.call(json!({"op":"commit","handle":handle,"mutations":[put("source",json!({"vector":[1.0]}))],"guards":[{"collection":"keys","key":"owner","expectedVersion":version}]})).is_err());
+    assert!(f.get(&handle,"source").is_null());
+    let current = f.get(&handle,"owner");
+    f.call(json!({"op":"commit","handle":handle,"mutations":[put("source",json!({"vector":[1.0]}))],"guards":[{"collection":"keys","key":"owner","expectedVersion":current["version"]}]})).unwrap();
+    assert_eq!(f.get(&handle,"owner"),current);
+    f.dispose();
+}
+
+/// Changes are snapshot pages shared across handles; rejected transactions publish no identities.
+#[test]
+fn object_change_pages_include_other_handles_deletions_and_rollback() {
+    let f = Fixture::new("first");
+    let reader = f.open("objects");
+    let writer = f.open("objects");
+    let initial = f.call(json!({"op":"changes","handle":reader,"after":null,"limit":2})).unwrap();
+    assert_eq!(initial["changes"], json!([]));
+    f.call(json!({"op":"commit","handle":writer,"mutations":[put("a",json!({"vector":[1,0]})),put("b",json!(null))]})).unwrap();
+    let mut cursor = initial["cursor"].clone();
+    let mut found = std::collections::BTreeMap::new();
+    loop {
+        let page = f.call(json!({"op":"changes","handle":reader,"after":cursor,"limit":2})).unwrap();
+        assert_eq!(page["reset"], false);
+        for change in page["changes"].as_array().unwrap() { found.insert(change["key"].as_str().unwrap().to_string(), change["entry"].clone()); }
+        cursor = page["cursor"].clone();
+        if page["hasMore"] == false { break; }
+    }
+    assert_eq!(found["a"]["value"], json!({"vector":[1,0]}));
+    assert!(found["b"].is_object());
+    assert!(found["b"]["value"].is_null());
+    assert!(f.call(json!({"op":"commit","handle":writer,"mutations":[put("rolled-back",json!(1)),{"collection":"keys","key":"a","value":2,"deleted":false,"checkVersion":true,"expectedVersion":"obsolete"}]})).is_err());
+    assert_eq!(f.call(json!({"op":"changes","handle":reader,"after":cursor,"limit":10})).unwrap()["changes"],json!([]));
+    f.call(json!({"op":"commit","handle":writer,"mutations":[{"collection":"keys","key":"a","value":null,"deleted":true,"checkVersion":false}]})).unwrap();
+    let deleted = f.call(json!({"op":"changes","handle":reader,"after":cursor,"limit":10})).unwrap();
+    assert_eq!(deleted["changes"],json!([{"collection":"keys","key":"a","entry":null}]));
+    assert!(f.call(json!({"op":"changes","handle":reader,"after":null,"limit":0})).is_err());
+    assert!(f.call(json!({"op":"changes","handle":reader,"after":"broken","limit":10})).is_err());
+    f.dispose();
+}
+
+/// An already-open reader sees synchronized transactions and synthetic merge writes.
+#[test]
+fn object_change_pages_include_sync_and_merged_identities() {
+    let first = Fixture::new("first");
+    let source = open_object_merge_fixture(&first);
+    seed_object_card(&first, &source, "card-a", "same", "identical");
+    let second = Fixture::new("second");
+    let reader = open_object_merge_fixture(&second);
+    seed_object_card(&second, &reader, "card-z", "same", "identical");
+    let before = second.call(json!({"op":"changes","handle":reader,"after":null,"limit":1000})).unwrap();
+    second.replay(&first.export());
+    let page = second.call(json!({"op":"changes","handle":reader,"after":before["cursor"],"limit":1000})).unwrap();
+    assert_eq!(page["reset"],false);
+    let changes = page["changes"].as_array().unwrap();
+    assert!(changes.iter().any(|change| change["key"] == "card-a" && change["entry"].is_object()));
+    assert!(changes.iter().any(|change| change["key"] == "card-z" && change["entry"].is_null()));
+    first.dispose(); second.dispose();
+}
+
+/// A recreated database and a consumer falling behind bounded retention require a fresh snapshot.
+#[test]
+fn object_change_pages_reset_for_foreign_and_trimmed_cursors() {
+    use operit_host_api::RuntimeSqliteHost;
+    let f = Fixture::new("first");
+    let handle = f.open("objects");
+    let initial = f.call(json!({"op":"changes","handle":handle,"after":null,"limit":10})).unwrap();
+    let foreign = f.call(json!({"op":"changes","handle":handle,"after":"foreign#0","limit":10})).unwrap();
+    assert_eq!(foreign["reset"],true);
+    // Feed a real transaction through the production triggers without 66k bridge round trips.
+    let mut connection = f.host.openSqliteDatabase(&f.path).unwrap();
+    connection.executeBatch("BEGIN; WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<66560) INSERT INTO _operit_changes(collection,key) SELECT 'keys',CAST(i AS TEXT) FROM n; COMMIT;").unwrap();
+    drop(connection);
+    let page = f.call(json!({"op":"changes","handle":handle,"after":initial["cursor"],"limit":10})).unwrap();
+    assert_eq!(page["reset"],true);
+    assert_eq!(page["changes"],json!([]));
+    f.dispose();
+}

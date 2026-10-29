@@ -94,6 +94,16 @@ pub struct StorageMutation {
     pub expected_version: Option<String>,
 }
 
+/// Guards a related record without rewriting it or publishing an extra change.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageRecordGuard {
+    pub collection: String,
+    pub key: String,
+    #[serde(rename = "expectedVersion")]
+    pub expected_version: Option<String>,
+}
+
 /// Identifies the last observed record state without exposing journal positions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,10 +182,15 @@ pub enum StorageRequest {
         after: Option<String>,
         limit: u32,
     },
+    /// Reads committed object changes after an opaque local cursor; null captures the current head.
+    #[serde(rename = "changes")]
+    Changes { handle: String, after: Option<String>, limit: u32 },
     #[serde(rename = "commit")]
     Commit {
         handle: String,
         mutations: Vec<StorageMutation>,
+        #[serde(default)]
+        guards: Vec<StorageRecordGuard>,
     },
 }
 
@@ -301,6 +316,26 @@ pub struct StorageMergeDescriptor {
 pub struct StorageSqlRow {
     pub columns: Vec<String>,
     pub values: Vec<StorageSqlValue>,
+}
+
+/// Carries the current value (or deletion) for one changed object identity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageObjectChange {
+    pub collection: String,
+    pub key: String,
+    pub entry: Option<StorageValueEntry>,
+}
+
+/// Pages a bounded local change journal, including synchronization and conflict-merge writes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StorageChangePage {
+    pub cursor: String,
+    pub reset: bool,
+    #[serde(rename = "hasMore")]
+    pub has_more: bool,
+    pub changes: Vec<StorageObjectChange>,
 }
 
 /// Reports one statement's affected rows and exact int64 insertion identity.
@@ -483,4 +518,5 @@ pub enum StorageResponse {
     GetMany(Vec<Option<StorageValueEntry>>),
     List(Vec<StorageKeyValueEntry>),
     Commit(StorageCommitResult),
+    Changes(StorageChangePage),
 }

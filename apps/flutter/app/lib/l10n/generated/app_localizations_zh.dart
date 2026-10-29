@@ -3690,13 +3690,13 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsPeerPortModeHelp =>
-      '固定模式使用填写的 IP 和端口，适用于内网穿透和端口映射。固定端口被占用时会报错，不会改变监听地址。';
+      '默认由系统分配可用端口，并通过局域网发现公布。固定模式使用填写的监听地址和端口，端口被占用时会报错。';
 
   @override
   String get settingsPeerPortMode => '端口分配方式';
 
   @override
-  String get settingsPeerPortModeFixed => '固定 IP 和端口';
+  String get settingsPeerPortModeFixed => '固定监听地址和端口';
 
   @override
   String get settingsPeerPortModeAutomatic => '自动分配端口';
@@ -3730,7 +3730,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get settingsPeerBindPortHelp => '固定模式使用此端口监听。';
 
   @override
-  String get settingsPeerBindPortAutomaticHelp => '自动模式会从此端口开始选择空闲端口。';
+  String get settingsPeerBindPortAutomaticHelp => '由系统分配可用端口；启动后显示实际端口。';
 
   @override
   String get settingsPeerDiscoveryNeedsTransport => '开启允许被搜索前，请至少选择一种暴露方式。';
@@ -3909,6 +3909,11 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get devicePickerNearby => '附近设备';
+
+  @override
+  String devicePickerDiscoveryFailed(String error) {
+    return '附近设备发现失败：$error';
+  }
 
   @override
   String get devicePickerEmpty => '暂未发现附近设备';
@@ -4199,4 +4204,61 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get runtimeActivityLoadingPackages => '加载扩展';
+
+  @override
+  String get peerQrTitle => '二维码连接';
+
+  @override
+  String get peerQrScan => '扫码连接';
+
+  @override
+  String get peerQrShow => '出示连接码';
+
+  @override
+  String get peerQrShowHint => '让另一台设备扫描此码，连接到这台设备。';
+
+  @override
+  String get peerQrScanHint => '扫描另一台设备的 Operit 连接码。';
+
+  @override
+  String get peerQrTrustHint => '二维码只提供连接地址。连接仍需对方显示的配对码，加入空间仍需审批。';
+
+  @override
+  String get peerQrListenerRequired => '请先在连接设置中开启接收连接，并连接到可用的网络。';
+
+  @override
+  String get peerQrCopy => '复制连接信息';
+
+  @override
+  String get peerQrCopied => '已复制';
+
+  @override
+  String get peerQrImport => '从图片识别';
+
+  @override
+  String get peerQrPaste => '或粘贴连接信息';
+
+  @override
+  String get peerQrRead => '识别连接信息';
+
+  @override
+  String get peerQrWrongDevice => '此连接码属于其他设备，请扫描当前所选设备的连接码。';
+
+  @override
+  String get peerQrImageInvalid => '未能从图片中识别二维码。请选择清晰的二维码图片（不超过 16 MB）。';
+
+  @override
+  String get peerQrCameraUnavailable => '此设备暂时无法使用相机扫码，你可以导入二维码图片或粘贴连接信息。';
+
+  @override
+  String get peerQrCameraPermission => '需要相机权限才能扫码。请在系统设置中允许相机访问，也可导入图片。';
+
+  @override
+  String get peerQrDevice => '连接设备';
+
+  @override
+  String get peerQrScanAgain => '重新扫码';
+
+  @override
+  String get peerQrMethodsHint => '发现不到设备？也可以使用连接码。';
 }

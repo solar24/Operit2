@@ -587,6 +587,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fslock"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -603,7 +613,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
 dependencies = [
  "futures-core",
- "futures-sink",
 ]
 
 [[package]]
@@ -1357,6 +1366,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "flume",
+ "if-addrs",
  "libc",
  "mdns-sd",
  "operit-host-api",
@@ -1395,6 +1406,7 @@ dependencies = [
  "reqwest",
  "tokio",
  "tokio-tungstenite",
+ "tower",
 ]
 
 [[package]]
@@ -1412,6 +1424,7 @@ dependencies = [
 name = "operit-host-native-storage"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "operit-host-api",
  "rusqlite",
  "uuid",
@@ -1469,7 +1482,6 @@ dependencies = [
  "flate2",
  "operit-host-api",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -1740,7 +1752,6 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "http",

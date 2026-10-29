@@ -2275,7 +2275,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "operit-cli"
-version = "2.0.0-preview.21"
+version = "2.0.0-preview.23"
 dependencies = [
  "arboard",
  "async-trait",
@@ -2307,6 +2307,7 @@ dependencies = [
  "operit-store",
  "operit-tools",
  "operit-util",
+ "qrcode",
  "rand_core 0.6.4",
  "ratatui",
  "reqwest",
@@ -2355,6 +2356,7 @@ dependencies = [
  "operit-proxy-local",
  "operit-runtime",
  "operit-tools",
+ "operit-util",
  "serde_json",
  "tokio",
 ]
@@ -2413,6 +2415,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "tokio",
  "tungstenite",
  "uuid",
  "zip",
@@ -2480,6 +2483,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "flume",
+ "if-addrs",
  "libc",
  "mdns-sd",
  "operit-host-api",
@@ -2505,6 +2510,7 @@ dependencies = [
  "reqwest",
  "tokio",
  "tokio-tungstenite",
+ "tower",
 ]
 
 [[package]]
@@ -2530,6 +2536,7 @@ dependencies = [
 name = "operit-host-native-storage"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "operit-host-api",
  "rusqlite",
  "uuid",
@@ -2602,6 +2609,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "operit-host-api",
+ "rmp",
  "rmp-serde",
  "serde",
  "serde_bytes",
@@ -2659,6 +2667,7 @@ dependencies = [
  "spake2",
  "syn 2.0.117",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -2818,6 +2827,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "operit-command-core",
+ "operit-edge-contract",
  "operit-host-api",
  "operit-link",
  "operit-local-models",
@@ -2892,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "operit-runtime"
-version = "2.0.0-preview.21"
+version = "2.0.0-preview.23"
 dependencies = [
  "aes",
  "async-trait",
@@ -3002,7 +3012,6 @@ dependencies = [
  "flate2",
  "operit-host-api",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -3327,6 +3336,12 @@ name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

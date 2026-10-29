@@ -3840,13 +3840,13 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsPeerPortModeHelp =>
-      'Fixed mode keeps the entered IP and port for tunnels and port forwarding. A busy fixed port reports an error without changing the address.';
+      'By default, the system assigns an available port and LAN discovery advertises it. Fixed mode uses the entered listen address and port and reports an error if the port is busy.';
 
   @override
   String get settingsPeerPortMode => 'Port allocation';
 
   @override
-  String get settingsPeerPortModeFixed => 'Fixed address and port';
+  String get settingsPeerPortModeFixed => 'Fixed listen address and port';
 
   @override
   String get settingsPeerPortModeAutomatic => 'Automatic port';
@@ -3883,7 +3883,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsPeerBindPortAutomaticHelp =>
-      'Automatic mode selects a free port starting from this value.';
+      'The system assigns an available port. The actual port appears after startup.';
 
   @override
   String get settingsPeerDiscoveryNeedsTransport =>
@@ -4071,6 +4071,11 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get devicePickerNearby => 'Nearby devices';
+
+  @override
+  String devicePickerDiscoveryFailed(String error) {
+    return 'Nearby device discovery failed: $error';
+  }
 
   @override
   String get devicePickerEmpty => 'No nearby devices found';
@@ -4374,4 +4379,70 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get runtimeActivityLoadingPackages => 'Loading extensions';
+
+  @override
+  String get peerQrTitle => 'QR connection';
+
+  @override
+  String get peerQrScan => 'Scan code';
+
+  @override
+  String get peerQrShow => 'My code';
+
+  @override
+  String get peerQrShowHint =>
+      'Scan this code on another device to connect to this device.';
+
+  @override
+  String get peerQrScanHint =>
+      'Scan the Operit connection code on the other device.';
+
+  @override
+  String get peerQrTrustHint =>
+      'The code shares connection addresses only. Pairing still requires the code shown on the other device; joining a space still requires approval.';
+
+  @override
+  String get peerQrListenerRequired =>
+      'Enable receiving connections in connection settings and connect to a network first.';
+
+  @override
+  String get peerQrCopy => 'Copy connection info';
+
+  @override
+  String get peerQrCopied => 'Copied';
+
+  @override
+  String get peerQrImport => 'Import QR image';
+
+  @override
+  String get peerQrPaste => 'Or paste connection info';
+
+  @override
+  String get peerQrRead => 'Read connection info';
+
+  @override
+  String get peerQrWrongDevice =>
+      'This code belongs to a different device. Scan the code for the selected device.';
+
+  @override
+  String get peerQrImageInvalid =>
+      'No QR code could be read. Choose a clear QR image smaller than 16 MB.';
+
+  @override
+  String get peerQrCameraUnavailable =>
+      'Camera scanning is unavailable. Import a QR image or paste connection info instead.';
+
+  @override
+  String get peerQrCameraPermission =>
+      'Camera access is required. Allow it in system settings, or import a QR image.';
+
+  @override
+  String get peerQrDevice => 'Connect device';
+
+  @override
+  String get peerQrScanAgain => 'Scan another code';
+
+  @override
+  String get peerQrMethodsHint =>
+      'Can’t find the device? Connect with a QR code.';
 }

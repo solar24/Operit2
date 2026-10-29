@@ -121,6 +121,13 @@ pub struct JsToolPkgWasmArg {
     pub value: Value,
 }
 
+/// Owns one declared module and its permitted public exports.
+#[derive(Clone)]
+pub struct JsToolPkgWasmModule {
+    pub bytes: Vec<u8>,
+    pub exports: Vec<String>,
+}
+
 /// Describes one ToolPkg WASM export call requested by JavaScript.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct JsToolPkgWasmRequest {
@@ -285,6 +292,11 @@ pub trait JsExecutionHost: Send + Sync {
         &self,
         request: JsToolPkgResourceRequest,
     ) -> Result<String, String>;
+
+    /// Loads a declared module for execution in the owning JavaScript realm.
+    fn load_toolpkg_wasm(&self, _package_target: &str, _module_id: &str) -> Result<JsToolPkgWasmModule, String> {
+        Err("ToolPkg WASM module loading is unavailable".to_string())
+    }
 
     /// Calls one scalar ToolPkg WASM export.
     fn call_toolpkg_wasm(
@@ -469,18 +481,22 @@ pub fn select_registered_package_tool(
     package: ToolPackage,
     function_name: &str,
 ) -> Result<crate::package::PackageTool, String> {
-    let package_name = package.name.clone();
-    let mut matches = package
-        .tools
-        .into_iter()
-        .filter(|tool| tool.name == function_name);
-    let definition = matches
-        .next()
+    let definition = select_registered_package_tool_ref(&package.name, &package.tools, function_name)?;
+    let index = package.tools.iter().position(|tool| std::ptr::eq(tool, definition)).unwrap();
+    Ok(package.tools.into_iter().nth(index).unwrap())
+}
+
+/// Validates one declaration while leaving unrelated package scripts borrowed.
+pub fn select_registered_package_tool_ref<'a>(
+    package_name: &str,
+    tools: impl IntoIterator<Item = &'a crate::package::PackageTool>,
+    function_name: &str,
+) -> Result<&'a crate::package::PackageTool, String> {
+    let mut matches = tools.into_iter().filter(|tool| tool.name == function_name);
+    let definition = matches.next()
         .ok_or_else(|| format!("Tool not registered: {package_name}:{function_name}"))?;
     if matches.next().is_some() {
-        return Err(format!(
-            "Duplicate tool registration: {package_name}:{function_name}"
-        ));
+        return Err(format!("Duplicate tool registration: {package_name}:{function_name}"));
     }
     if definition.advice {
         return Err(format!(
@@ -634,6 +650,14 @@ pub trait JsExecutionEngine: Send + Sync {
         on_intermediate_result: Option<Arc<dyn Fn(String) + Send + Sync>>,
         dispatch_intermediate_on_main: bool,
     ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>>;
+
+    /// Transfers an already owned package script and arguments into an asynchronous request.
+    fn execute_script_function_owned(
+        &self, script: String, function_name: String, params: BTreeMap<String, Value>,
+        env_overrides: BTreeMap<String, String>,
+    ) -> JsExecutionCompletion<JsExecutionResult<Option<String>>> {
+        self.execute_script_function(&script, &function_name, &params, &env_overrides, None, true)
+    }
 
     /// Executes a before hook under its caller-owned millisecond completion deadline.
     fn execute_script_function_with_timeout_millis(

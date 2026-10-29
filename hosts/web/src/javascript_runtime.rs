@@ -1,7 +1,7 @@
 use js_sys::{Array, Function, Object, Reflect};
 use operit_host_api::{
     HostError, HostJavaScriptAsyncJsonCallback, HostJavaScriptExecutionInterrupt,
-    HostJavaScriptInterruptHandler, HostJavaScriptCallback, HostJavaScriptRuntime,
+    HostJavaScriptInterruptController, HostJavaScriptInterruptSubscription, HostJavaScriptCallback, HostJavaScriptRuntime,
     HostJavaScriptValue, HostJavaScriptRuntimeHost, HostJavaScriptRuntimeState, HostJavaScriptRuntimeStateAsyncTask,
     HostJavaScriptRuntimeStateFactory, HostJavaScriptRuntimeStateHandle,
     HostJavaScriptRuntimeStateOutput, HostJavaScriptRuntimeStateOutputFuture,
@@ -10,8 +10,8 @@ use operit_host_api::{
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 
 thread_local! {
@@ -47,12 +47,84 @@ static NEXT_JAVASCRIPT_STATE_ID: AtomicU64 = AtomicU64::new(1);
 enum WebJavaScriptBinding {
     Synchronous(HostJavaScriptCallback),
     Asynchronous(HostJavaScriptAsyncJsonCallback),
+    Binary(operit_host_api::HostJavaScriptBinaryCallback),
+}
+
+#[derive(Default)]
+struct WebExecution {
+    generation: u64,
+    subscriptions: Vec<HostJavaScriptInterruptSubscription>,
+}
+
+/// Cancellation and transport messages notify the same shared atomic wait word.
+struct WebInterruptController {
+    signal: [AtomicI32; 4],
+    execution: Mutex<WebExecution>,
+    owner: Weak<Self>,
+}
+
+impl WebInterruptController {
+    fn new() -> Arc<Self> {
+        Arc::new_cyclic(|owner| Self {
+            signal: std::array::from_fn(|_| AtomicI32::new(0)),
+            execution: Mutex::new(WebExecution::default()), owner: owner.clone(),
+        })
+    }
+
+    fn signalView(&self) -> js_sys::Int32Array {
+        let memory = wasm_bindgen::memory().unchecked_into::<js_sys::WebAssembly::Memory>();
+        js_sys::Int32Array::new_with_byte_offset_and_length(
+            &memory.buffer(), self.signal.as_ptr() as u32, 4,
+        )
+    }
+
+    fn notify(&self) {
+        self.signal[0].fetch_add(1, Ordering::AcqRel);
+        let _ = js_sys::Atomics::notify(&self.signalView(), 0);
+    }
+
+    fn cancel(&self, generation: u64) {
+        let execution = self.execution.lock().expect("Web JavaScript execution scope poisoned");
+        if execution.generation == generation {
+            self.signal[1].store(1, Ordering::Release);
+            self.notify();
+        }
+    }
+}
+
+impl HostJavaScriptInterruptController for WebInterruptController {
+    fn replace(&self, tokens: Vec<HostJavaScriptExecutionInterrupt>) {
+        let deadline = tokens.iter().filter_map(HostJavaScriptExecutionInterrupt::deadlineMillis)
+            .min().unwrap_or(0) as u64;
+        let (generation, previous) = {
+            let mut execution = self.execution.lock().expect("Web JavaScript execution scope poisoned");
+            execution.generation += 1;
+            self.signal[1].store(0, Ordering::Release);
+            self.signal[2].store(deadline as i32, Ordering::Release);
+            self.signal[3].store((deadline >> 32) as i32, Ordering::Release);
+            (execution.generation, std::mem::take(&mut execution.subscriptions))
+        };
+        drop(previous);
+        let subscriptions = tokens.iter().map(|token| {
+            let owner = self.owner.clone();
+            token.onInterrupt(Arc::new(move || {
+                if let Some(owner) = owner.upgrade() { owner.cancel(generation); }
+            }))
+        }).collect();
+        {
+            let mut execution = self.execution.lock().expect("Web JavaScript execution scope poisoned");
+            if execution.generation != generation { return; }
+            execution.subscriptions = subscriptions;
+        }
+        for token in &tokens { token.shouldInterrupt(); }
+        self.notify();
+    }
 }
 
 struct WebHostJavaScriptRuntime {
     runtime: JsValue,
     bindings: Rc<RefCell<BTreeMap<String, WebJavaScriptBinding>>>,
-    interruptHandler: Option<HostJavaScriptInterruptHandler>,
+    interrupts: Arc<WebInterruptController>,
 }
 
 impl WebHostJavaScriptRuntime {
@@ -71,6 +143,16 @@ impl WebHostJavaScriptRuntime {
                     JsValue::from_str(&format!("JavaScript host binding is unavailable: {name}"))
                 })?;
                 let value = match binding {
+                    WebJavaScriptBinding::Binary(callback) => {
+                        let arguments = arguments.into_iter().map(HostJavaScriptValue::into_json)
+                            .collect::<HostResult<Vec<_>>>().map_err(|error| JsValue::from_str(&error.to_string()))?;
+                        let (metadata, bytes) = callback(arguments).map_err(|error| JsValue::from_str(&error.to_string()))?;
+                        let result = Object::new();
+                        let metadata = structuredValue(&metadata).map_err(|error| JsValue::from_str(&error.to_string()))?;
+                        Reflect::set(&result, &JsValue::from_str("metadata"), &metadata)?;
+                        Reflect::set(&result, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes.as_slice()))?;
+                        return Ok(result.into());
+                    }
                     WebJavaScriptBinding::Synchronous(callback) => callback(arguments),
                     WebJavaScriptBinding::Asynchronous(callback) => {
                         let arguments = arguments.into_iter().map(HostJavaScriptValue::into_json).collect::<HostResult<Vec<_>>>()
@@ -91,12 +173,6 @@ impl WebHostJavaScriptRuntime {
             },
         )
             as Box<dyn FnMut(String, JsValue) -> Result<JsValue, JsValue>>);
-        let handler = self.interruptHandler.clone();
-        let interrupt =
-            Closure::wrap(
-                Box::new(move || handler.as_ref().is_some_and(|handler| handler()))
-                    as Box<dyn FnMut() -> bool>,
-            );
         let function = Reflect::get(&self.runtime, &JsValue::from_str("execute"))
             .map_err(crate::common::js_error)?
             .dyn_into::<Function>()
@@ -106,7 +182,7 @@ impl WebHostJavaScriptRuntime {
                 &self.runtime,
                 &structuredValue(&command)?,
                 callback.as_ref(),
-                interrupt.as_ref(),
+                self.interrupts.signalView().as_ref(),
             )
             .map_err(crate::common::js_error)
     }
@@ -124,6 +200,12 @@ impl Drop for WebHostJavaScriptRuntime {
 }
 
 impl HostJavaScriptRuntime for WebHostJavaScriptRuntime {
+    fn registerHostJavaScriptBinaryFunction(&mut self, name: &str, callback: operit_host_api::HostJavaScriptBinaryCallback) -> HostResult<()> {
+        self.execute(serde_json::json!({"operation":"binding","name":name,"factory":"syncBinding"}))?;
+        self.bindings.borrow_mut().insert(name.to_string(), WebJavaScriptBinding::Binary(callback));
+        Ok(())
+    }
+
     /// Executes the shared bootstrap source in this browser runtime's independent realm.
     fn evaluateHostJavaScriptBootstrap(&mut self, source: &'static str) -> HostResult<()> {
         self.evaluateHostJavaScriptVoid("operit.bootstrap.js", source)
@@ -169,13 +251,9 @@ impl HostJavaScriptRuntime for WebHostJavaScriptRuntime {
             .map(|_| ())
     }
 
-    /// Replaces the predicate used while waiting for browser execution or host callbacks.
-    fn setHostJavaScriptInterruptHandler(
-        &mut self,
-        handler: Option<HostJavaScriptInterruptHandler>,
-    ) -> HostResult<()> {
-        self.interruptHandler = handler;
-        Ok(())
+    /// Shares event notifications with the browser transport through Wasm memory.
+    fn interruptController(&self) -> Arc<dyn HostJavaScriptInterruptController> {
+        self.interrupts.clone()
     }
 
     /// Invokes a lifecycle function and reads its trusted structured snapshot.
@@ -375,7 +453,7 @@ impl HostJavaScriptRuntimeHost for WebHostJavaScriptRuntimeHost {
                 .call0(&JsValue::UNDEFINED)
                 .map_err(crate::common::js_error)?,
             bindings: Rc::new(RefCell::new(BTreeMap::new())),
-            interruptHandler: None,
+            interrupts: WebInterruptController::new(),
         };
         runtime.execute(serde_json::json!({"operation":"initialize","source":include_str!("javascript_promises.js")}))?;
         Ok(Box::new(runtime))

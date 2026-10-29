@@ -70,6 +70,10 @@ pub(crate) mod media;
 pub mod AttachmentTransferManager;
 pub use AttachmentTransferManager::*;
 
+#[path = "FileSelectionService.rs"]
+pub mod FileSelectionService;
+pub use FileSelectionService::*;
+
 #[path = "ComposeDslSessionService.rs"]
 pub mod ComposeDslSessionService;
 
@@ -78,3 +82,5 @@ pub mod WorkActivityService;
 
 #[path = "LocalLlmService.rs"]
 pub(crate) mod LocalLlmService;
+
+mod chat_input_stream;

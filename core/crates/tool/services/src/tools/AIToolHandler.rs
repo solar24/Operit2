@@ -461,6 +461,11 @@ impl AIToolHandler {
             .clone()
     }
 
+    /// Shares the system capability without cloning the complete host environment.
+    pub(crate) fn systemOperationHost(&self) -> Option<Arc<dyn operit_host_api::SystemOperationHost>> {
+        self.inner.lock().expect("AIToolHandler mutex poisoned").context.systemOperationHost.clone()
+    }
+
     /// Returns the host manager associated with this handler.
     #[allow(non_snake_case)]
     pub fn getContext(&self) -> HostManager {
@@ -761,12 +766,7 @@ impl AIToolHandler {
                 .first()
                 .map(|tool| tool.script.contains("/* MCPJS"))
                 .unwrap_or(false);
-        let executableTools = toolPackage
-            .tools
-            .iter()
-            .filter(|packageTool| !packageTool.advice)
-            .cloned()
-            .collect::<Vec<_>>();
+        let executableTools = toolPackage.tools.iter().filter(|tool| !tool.advice);
         let context = self.getContext();
         for packageTool in executableTools {
             let toolName = format!("{}:{}", toolPackage.name, packageTool.name);
@@ -781,7 +781,7 @@ impl AIToolHandler {
                 self.registerAsyncTool(
                     toolName,
                     Box::new(PackageToolExecutor::new(
-                        toolPackage.clone(),
+                        toolPackage.name.clone(),
                         packageManager.clone(),
                     )),
                 );
@@ -1468,6 +1468,12 @@ impl JsExecutionHost for AIToolHandler {
         crate::tools::ToolJsRuntime::materializeToolPkgResource(self, request)
     }
 
+    /// Loads a module once; compilation and instance lifetime belong to the JavaScript realm.
+    fn load_toolpkg_wasm(&self, target: &str, module_id: &str) -> Result<operit_plugin_sdk::javascript::JsToolPkgWasmModule, String> {
+        self.getOrCreatePackageManager().lock().expect("package manager mutex poisoned")
+            .loadToolPkgWasmModule(target, module_id)
+    }
+
     /// Calls one ToolPkg WASM export through the active package manager.
     fn call_toolpkg_wasm(
         &self,
@@ -1891,6 +1897,11 @@ mod tests {
         &self,
     ) -> Result<Vec<operit_plugin_sdk::js_sdk::models::ModelsSummary>, String> { panic!("Unexpected runtime service: listModelSummaries") }
         /// Rejects unexpected application service access in execution pipeline tests.
+    fn speakSpeech(&self, _request: operit_plugin_sdk::js_sdk::tts::TtsSpeakRequest)
+        -> Result<operit_plugin_sdk::js_sdk::results::TtsSpeakResultData, String> {
+        panic!("Unexpected runtime service: speakSpeech")
+    }
+        /// Rejects unexpected application service access in execution pipeline tests.
     fn listTtsConfigs(
         &self,
     ) -> Result<Vec<operit_plugin_sdk::js_sdk::tts::TtsConfig>, String> { panic!("Unexpected runtime service: listTtsConfigs") }
@@ -2145,6 +2156,89 @@ mod tests {
             assert_eq!(manager.lock().unwrap().getEnabledPackageNames(), enabled);
             assert!(fixture.handler.hasToolExecutor("clock_probe:get_current_date"));
             assert_eq!(fixture.handler.getToolVisibility("clock_probe:get_current_date"), Some(ToolRegistrationVisibility::PUBLIC));
+        }
+    }
+
+    /// Exercises the real public API engine: plugin exceptions and runaway scripts are bounded, and later calls recover.
+    #[tokio::test(flavor = "current_thread")]
+    async fn configuration_public_api_deadline_isolates_broken_scripts() {
+        use std::io::{Cursor, Write};
+        use crate::tools::packTool::RuntimePackageManager::RuntimePackageManager;
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, content) in [
+            ("manifest.json", r#"{"schema_version":1,"toolpkg_id":"configuration_probe","api_version":"2.0.0","main":"main.js","public_api":"api.ts","enabled_by_default":true}"#),
+            ("api.ts", "export {};"),
+            ("main.js", r#"
+                exports.resolve = function(event) {
+                    if (event.payload.mode === 'error') throw new Error('missing provider');
+                    if (event.payload.mode === 'loop') { while (true) {} }
+                    return { ready: true };
+                };
+                exports.registerToolPkg = function() {
+                    ToolPkg.registerApi({ name: 'chat.configuration.resolve', function: exports.resolve });
+                };
+            "#),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        let assets = Box::leak(vec![RuntimePluginAsset {
+            name: "configuration_probe.toolpkg", sha256: "",
+            bytes: Box::leak(zip.finish().unwrap().into_inner().into_boxed_slice()),
+        }].into_boxed_slice());
+        operit_host_api::HostManager::setDefaultHostJavaScriptRuntimeHost(Arc::new(
+            operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new(),
+        ));
+        struct LanguageHost;
+        impl operit_host_api::SystemOperationHost for LanguageHost {
+            fn getSystemLanguageCode(&self) -> operit_host_api::HostResult<String> { Ok("en".into()) }
+            fn sendNotification(&self, request: &operit_host_api::SystemNotificationRequest) -> operit_host_api::HostResult<()> { panic!("Unexpected host call: sendNotification") }
+            fn modifySystemSetting(&self, namespace: &str, setting: &str, value: &str,) -> operit_host_api::HostResult<operit_host_api::SystemSettingData> { panic!("Unexpected host call: modifySystemSetting") }
+            fn getSystemSetting(&self, namespace: &str, setting: &str) -> operit_host_api::HostResult<operit_host_api::SystemSettingData> { panic!("Unexpected host call: getSystemSetting") }
+            fn installApp(&self, path: &str) -> operit_host_api::HostResult<operit_host_api::AppOperationData> { panic!("Unexpected host call: installApp") }
+            fn uninstallApp(&self, packageName: &str) -> operit_host_api::HostResult<operit_host_api::AppOperationData> { panic!("Unexpected host call: uninstallApp") }
+            fn listInstalledApps(&self, includeSystemApps: bool) -> operit_host_api::HostResult<operit_host_api::AppListData> { panic!("Unexpected host call: listInstalledApps") }
+            fn startApp(&self, packageName: &str) -> operit_host_api::HostResult<operit_host_api::AppOperationData> { panic!("Unexpected host call: startApp") }
+            fn stopApp(&self, packageName: &str) -> operit_host_api::HostResult<operit_host_api::AppOperationData> { panic!("Unexpected host call: stopApp") }
+            fn getNotifications(&self, limit: i32, includeOngoing: bool) -> operit_host_api::HostResult<operit_host_api::NotificationData> { panic!("Unexpected host call: getNotifications") }
+            fn getAppUsageTime(&self, packageName: &str, sinceHours: i32, limit: i32, includeSystemApps: bool,) -> operit_host_api::HostResult<operit_host_api::AppUsageTimeResultData> { panic!("Unexpected host call: getAppUsageTime") }
+            fn getDeviceLocation(&self, timeout: i32, highAccuracy: bool, includeAddress: bool,) -> operit_host_api::HostResult<operit_host_api::LocationData> { panic!("Unexpected host call: getDeviceLocation") }
+            fn getDeviceInfo(&self) -> operit_host_api::HostResult<operit_host_api::DeviceInfoData> { panic!("Unexpected host call: getDeviceInfo") }
+            fn captureScreenshot(&self) -> operit_host_api::HostResult<String> { panic!("Unexpected host call: captureScreenshot") }
+            fn recognizeText(&self, imagePath: &str, language: operit_host_api::OCRLanguage, quality: operit_host_api::OCRQuality,) -> operit_host_api::HostResult<String> { panic!("Unexpected host call: recognizeText") }
+        }
+        let mut fixture = PipelineFixture::with_package_assets(Some(assets));
+        fixture.handler.authenticatedExtensionOwner = None;
+        fixture.handler.inner.lock().unwrap().context.systemOperationHost = Some(Arc::new(LanguageHost));
+        operit_util::RuntimeStoreRoot::setDefaultRuntimeStoreRootConfig(
+            operit_util::RuntimeStoreRoot::RuntimeStoreRootConfig::new(
+                fixture.root.join("runtime"), fixture.root.join("workspaces"),
+            ),
+        );
+        let context = fixture.handler.getContext();
+        operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(context.runtimeStorageHost.unwrap());
+        operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(context.runtimeSqliteHost.unwrap());
+        let shared = fixture.handler.getOrCreatePackageManager();
+        {
+            let mut manager = shared.lock().unwrap();
+            assert!(manager.claimInitialPackageRegistryLoad().unwrap());
+            manager.loadAvailablePackages();
+        }
+        let manager = RuntimePackageManager::readySnapshot(shared).await.unwrap();
+        assert!(manager.getToolPkgLoadIssues().is_empty(), "{:?}", manager.getToolPkgLoadIssues());
+        for (mode, expected_error) in [("ready", None), ("error", Some("missing provider")), ("loop", Some("timed out")), ("ready", None)] {
+            let started = std::time::Instant::now();
+            let result = manager.invokeToolPkgPublicApiWithTimeoutMillis(
+                "configuration_probe", "chat.configuration.resolve", serde_json::json!({"mode":mode}),
+                if mode == "loop" { 100 } else { 1_000 },
+            ).await;
+            if let Some(expected) = expected_error {
+                let error = result.unwrap_err();
+                assert!(error.contains(expected), "{mode}: {error}");
+            } else {
+                assert_eq!(result.unwrap(), serde_json::json!({"ready":true}));
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
         }
     }
 

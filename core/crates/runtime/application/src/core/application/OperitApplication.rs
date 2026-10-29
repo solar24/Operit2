@@ -46,6 +46,7 @@ use operit_store::SyncOperationStore::{
     boundSyncOperationPage, compactSyncOperations, SyncOperation, SyncOperationKnowledge,
     SyncOperationSemantics, SyncOperationStore, SyncReceipt, DEFAULT_SYNC_PAGE_BYTES,
 };
+use sha2::{Digest, Sha256};
 use operit_tools::files::PathMapper::PathMapper;
 use operit_tools::files::VisualFileSystem::VisualFileSystem;
 use operit_tools::runtime_support::ToolRuntimeDependencies;
@@ -318,12 +319,10 @@ impl OperitApplication {
         AppLogger::v("OperitApplication", "runtime initialization start");
         setHostManager(self.hostManager.clone());
         if let Some(storage) = self.hostManager.runtimeStorageHost.clone() {
-            if let Err(error) =
-                operit_store::ExtensionStore::ExtensionStore::new(storage).migrateLegacyLayout()
-            {
+            if let Err(error) = PreferenceSpaceMerge::layout(storage).prepare() {
                 AppLogger::e(
-                    "ExtensionMigration",
-                    &format!("Legacy data retained; migration will retry: {error}"),
+                    "PreferenceLayout",
+                    &format!("Preference layout migration incomplete: {error}"),
                 );
             }
         }
@@ -875,6 +874,73 @@ impl OperitApplication {
         Ok(result)
     }
 
+    /// Returns a compact change fingerprint of the state a full synchronization
+    /// pass would exchange. Peers poll this instead of the full receipt: the
+    /// receipt carries one exact range per synced entity, which grows with the
+    /// Space and made every idle probe transfer the complete clock.
+    ///
+    /// Only durable operation clocks are fingerprinted. A storage-handle close
+    /// publishes a process mutation without writing any operation, so the
+    /// mutation revision cannot distinguish real changes from idle opens.
+    /// Only origins this device authored count as a change: applying a peer's
+    /// operations advances their ranges locally, but that is not new work to
+    /// offer the other members. Device preferences and projected control
+    /// operations change no clock, but the device that made them detects them
+    /// in its own local-state summary and starts the pass that pushes them to
+    /// its peers.
+    #[allow(non_snake_case)]
+    pub fn syncClockDigest(&self) -> Result<serde_json::Value, String> {
+        let store = self.runtimeSyncOperationStore()?;
+        let localDeviceId = store
+            .localDeviceId()
+            .map_err(|error| error.to_string())?;
+        let mut clock = store
+            .currentLocalClock()
+            .map_err(|error| error.to_string())?;
+        // Chat operations live in their own SQL journal; merge its clock the
+        // same way the local-state summary does so chat-only writes are seen.
+        if operit_util::RuntimeStoreRoot::default_runtime_store_root_config().is_some() {
+            match SqlChatSyncStore::default() {
+                Ok(sqlStore) => match sqlStore.localClock() {
+                    Ok(sqlClock) => {
+                        for (deviceId, sequence) in sqlClock.sequences {
+                            if sequence > clock.sequenceFor(&deviceId) {
+                                clock.setSequence(deviceId, sequence);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        operit_util::AppLogger::AppLogger::v_with_level(
+                            "CoreSyncTrace",
+                            &format!("sync_clock_digest.chat_clock_unavailable error={error}"),
+                            operit_util::AppLogger::VERBOSE_LEVEL_6,
+                        );
+                    }
+                },
+                Err(error) => {
+                    operit_util::AppLogger::AppLogger::v_with_level(
+                        "CoreSyncTrace",
+                        &format!("sync_clock_digest.chat_storage_unavailable error={error}"),
+                        operit_util::AppLogger::VERBOSE_LEVEL_6,
+                    );
+                }
+            }
+        }
+        // Operations applied from peers advance their origins in this clock.
+        // Fingerprinting every origin would make each applied batch look like
+        // new work to every neighbor, reopening full passes that have nothing
+        // to exchange. Advertise only what this device authored: members
+        // synchronize with each other over routed links, and projected control
+        // operations are advertised through the local-state summary.
+        clock.retainAuthoredBy(&localDeviceId);
+        let fingerprint = serde_json::to_vec(&clock).map_err(|error| error.to_string())?;
+        let digest = Sha256::digest(&fingerprint);
+        Ok(serde_json::json!({
+            "protocolVersion": 1,
+            "digest": format!("{digest:x}"),
+        }))
+    }
+
     /// Exports missing operations while reporting independently unavailable storage engines.
     #[allow(non_snake_case)]
     pub fn syncOperationsSince(
@@ -885,9 +951,14 @@ impl OperitApplication {
     ) -> Result<serde_json::Value, String> {
         let receipt: SyncReceipt = serde_json::from_value(clock).map_err(|error| error.to_string())?;
         receipt.validate()?;
+        let storage = self.hostManager.runtimeStorageHost.clone()
+            .ok_or("RuntimeStorageHost is not registered for persistent sync")?;
+        let mut errors = Vec::new();
+        if let Err(error) = PreferenceSpaceMerge::layout(storage).prepare() {
+            errors.push(format!("preference layout: {error}"));
+        }
         let store = self.runtimeSyncOperationStore()?;
         let mut operations = Vec::new();
-        let mut errors = Vec::new();
         let mut failedDomains = std::collections::BTreeSet::new();
         match store.operationsSinceWithBudget(
             &receipt,
@@ -951,14 +1022,11 @@ impl OperitApplication {
         }
         let mut unique = BTreeMap::new();
         for operation in operations {
-            if let Some(existing) = unique.insert(operation.opId.clone(), operation.clone()) {
-                if existing != operation {
-                    return Err(format!(
-                        "Conflicting immutable operation {}",
-                        operation.opId
-                    ));
-                }
+            if let Some(existing) = unique.get(&operation.opId) {
+                if !operit_store::SyncOperationStore::incomingSyncOperationWins(existing, &operation)
+                    .map_err(|error| error.to_string())? { continue; }
             }
+            unique.insert(operation.opId.clone(), operation);
         }
         let mut operations = unique.into_values().collect::<Vec<_>>();
         operations.sort_by(|left, right| {
@@ -999,8 +1067,10 @@ impl OperitApplication {
             .ok_or("RuntimeStorageHost is not registered for persistent sync")?;
         let mut errors = Vec::new();
         let mut applied = Vec::new();
+        let mut skipped = Vec::new();
+        let mut retiredCount = 0;
         let mut preferenceReferences = std::collections::BTreeMap::new();
-        let preferences = pending
+        let mut preferences = pending
             .iter()
             .filter(|operation| operation.domain == "preferences")
             .cloned()
@@ -1010,22 +1080,45 @@ impl OperitApplication {
                 .iter()
                 .any(|operation| operation.domain == PLUGIN_STORAGE_SYNC_DOMAIN)
         {
-            match store.preferenceMergeHistory() {
-                Err(error) => {
-                    errors.push(format!("preference history: {error}"));
-                }
-                Ok(history) => {
+            let prepared = store
+                .preferenceMergeHistory()
+                .map_err(|error| error.to_string())
+                .and_then(|mut history| {
+                    let count = match PreferenceSpaceMerge::layout(storage.clone())
+                        .prepareOperations(&mut history, &mut preferences) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            errors.push(format!("preference layout: {error}"));
+                            0
+                        }
+                    };
+                    Ok((history, count))
+                });
+            match prepared {
+                Err(error) => errors.push(format!("preference preparation: {error}")),
+                Ok((history, count)) => {
+                    retiredCount = count;
                     for outcome in applyIndependentOperations(
                         storage.clone(),
-                        &PreferenceSpaceMerge::schema(&history.iter().chain(&preferences).cloned().collect::<Vec<_>>()),
+                        &PreferenceSpaceMerge::schema(
+                            &history
+                                .iter()
+                                .chain(&preferences)
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        ),
                         &history,
                         &preferences,
                         |path, key| !isRetiredCharacterPreferenceKey(path, key),
                     ) {
                         match outcome.result {
                             Ok(map) => {
-                                preferenceReferences.extend(map);
-                                applied.extend(outcome.operations);
+                                if outcome.skipped {
+                                    skipped.extend(outcome.operations);
+                                } else {
+                                    preferenceReferences.extend(map);
+                                    applied.extend(outcome.operations);
+                                }
                             }
                             Err(error) => {
                                 errors.push(format!(
@@ -1045,8 +1138,15 @@ impl OperitApplication {
         {
             let ordered = operation.semantics == SyncOperationSemantics::Transaction;
             let dataset = match synchronizationDataset(operation) {
-                Ok(dataset) => (operation.originDeviceId.clone(), operation.domain.clone(), dataset),
-                Err(error) => { errors.push(format!("dataset op={}: {error}", operation.opId)); continue; }
+                Ok(dataset) => (
+                    operation.originDeviceId.clone(),
+                    operation.domain.clone(),
+                    dataset,
+                ),
+                Err(error) => {
+                    errors.push(format!("dataset op={}: {error}", operation.opId));
+                    continue;
+                }
             };
             if ordered && blocked.contains(&dataset) { continue; }
             let result = (|| -> Result<(), String> {
@@ -1058,7 +1158,9 @@ impl OperitApplication {
                         .map_err(|error| error.to_string())?
                         .applyOperation(operation)
                         .map_err(|error| error.to_string()),
-                    BINDING_SYNC_DOMAIN => self.runtimeBindingStore()?.applySyncedOperation(operation),
+                    BINDING_SYNC_DOMAIN => {
+                        self.runtimeBindingStore()?.applySyncedOperation(operation)
+                    }
                     NETWORK_CONTROL_SYNC_DOMAIN => self
                         .runtimeNetworkControlStore()?
                         .applySyncedOperation(operation),
@@ -1105,6 +1207,14 @@ impl OperitApplication {
                 }
             }
         }
+        let skippedCount = retiredCount
+            + match store.skipOperations(&skipped) {
+                Ok(()) => skipped.len(),
+                Err(error) => {
+                    errors.push(format!("skip obsolete preference operations: {error}"));
+                    0
+                }
+            };
         if let Err(error) = store.completeOperations(&applied) {
             errors.push(format!("complete pending operations: {error}"));
         }
@@ -1135,7 +1245,7 @@ impl OperitApplication {
             );
         }
         Ok(
-            serde_json::json!({ "received": operations.len(), "applied": applied.len(), "pending": remaining, "errors": errors }),
+            serde_json::json!({ "received": operations.len(), "applied": applied.len(), "skipped": skippedCount, "pending": remaining, "errors": errors }),
         )
     }
 

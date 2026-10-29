@@ -1,5 +1,5 @@
 //! Executes the shared preference merge declarations for Rust owners and plugins.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use operit_host_api::RuntimeStorageHost;
@@ -31,7 +31,7 @@ pub(crate) fn isMergeMetadata(operation: &SyncOperation) -> bool {
 pub struct PreferenceMergeStore {
     pub path: String,
     pub encrypted: bool,
-    pub storageVersion: Option<u32>,
+    pub open: fn(Arc<dyn RuntimeStorageHost>, &str) -> PreferencesDataStore,
     pub decode: Option<fn(&mut PreferencesSyncedEntry) -> Result<(), PreferencesDataStoreError>>,
     pub merge: StoragePreferencesMergeDescriptor,
 }
@@ -41,13 +41,13 @@ impl PreferenceMergeStore {
     pub fn values(
         path: impl Into<String>,
         encrypted: bool,
-        storageVersion: u32,
+        open: fn(Arc<dyn RuntimeStorageHost>, &str) -> PreferencesDataStore,
         decode: fn(&mut PreferencesSyncedEntry) -> Result<(), PreferencesDataStoreError>,
     ) -> Self {
         Self {
             path: path.into(),
             encrypted,
-            storageVersion: Some(storageVersion),
+            open,
             decode: Some(decode),
             merge: StoragePreferencesMergeDescriptor {
                 version: 1,
@@ -66,6 +66,35 @@ pub struct PreferenceMergeSchema {
 }
 
 impl PreferenceMergeSchema {
+    /// Resolves explicit native files and the plugin API's Space-owned preference namespace.
+    /// An unrelated file is not an implicit preference owner.
+    fn owner(&self, path: &str) -> Result<Option<PreferenceMergeStore>, String> {
+        if let Some(owner) = self.stores.iter().find(|store| store.path == path) {
+            return Ok(Some(owner.clone()));
+        }
+        use operit_util::RuntimeStorageLayout::{PLUGIN_DATA_SPACE_DIR_PATH, PLUGIN_DATA_DEVICE_DIR_PATH};
+        if ![PLUGIN_DATA_SPACE_DIR_PATH, PLUGIN_DATA_DEVICE_DIR_PATH].iter()
+            .any(|root| path.starts_with(&format!("{root}/"))) {
+            return Ok(None);
+        }
+        let canonical = operit_util::PluginStoragePaths::resolveStoragePath(path)?;
+        if canonical != path || !path.ends_with(".preferences.json") {
+            return Err("Invalid synchronized plugin preference path".into());
+        }
+        use operit_util::RuntimeStorageLayout::{runtimeStorageOwnership, RuntimeStorageOwnership};
+        if runtimeStorageOwnership(path)? != RuntimeStorageOwnership::Space {
+            return Err("Synchronized preferences require Space-owned storage".into());
+        }
+        Ok(Some(PreferenceMergeStore {
+            path: path.to_owned(), encrypted: false,
+            open: |storage, path| PreferencesDataStore::newWithStorage(storage, path),
+            decode: None,
+            merge: StoragePreferencesMergeDescriptor {
+                version: 1, catalog: None, references: Vec::new(), projection: None,
+            },
+        }))
+    }
+
     /// Iterates the catalogs together with their explicit storage ownership.
     fn catalogs(&self) -> impl Iterator<Item = (&PreferenceMergeStore, &StoragePreferencesMergeCatalog)> {
         self.stores.iter().filter_map(|store| store.merge.catalog.as_ref().map(|catalog| (store, catalog)))
@@ -212,10 +241,10 @@ fn pluginDeclarations(entries: &[PreferencesSyncedEntry]) -> Result<BTreeMap<Str
             let descriptor: StoragePreferencesMergeDescriptor = serde_json::from_value(value.clone())?;
             validatePluginDeclaration(&path, &descriptor).map_err(PreferencesDataStoreError::Message)?;
             match declarations.entry(path.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(descriptor); }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &descriptor =>
+                Entry::Vacant(entry) => { entry.insert(descriptor); }
+                Entry::Occupied(entry) if entry.get() != &descriptor =>
                     return Err(PreferencesDataStoreError::Message("Conflicting preference merge declarations".into())),
-                std::collections::btree_map::Entry::Occupied(_) => {}
+                Entry::Occupied(_) => {}
             }
             extracted = true;
             Ok(())
@@ -226,10 +255,12 @@ fn pluginDeclarations(entries: &[PreferencesSyncedEntry]) -> Result<BTreeMap<Str
     Ok(declarations)
 }
 
-/// Records one dataset commit result without sharing its failure boundary with referenced datasets.
+/// Reports a dataset commit or terminal skip without sharing failure boundaries with other datasets.
 pub struct PreferenceMergeOutcome {
     pub paths: BTreeSet<String>,
     pub operations: Vec<SyncOperation>,
+    /// Terminally ignores unowned, older or unversioned operations without applying their values.
+    pub skipped: bool,
     pub result: Result<BTreeMap<String, String>, String>,
 }
 
@@ -244,20 +275,93 @@ pub fn applyIndependentOperations<F>(
 where
     F: Fn(&str, &str) -> bool + Copy,
 {
+    let mut stores = PreferenceStores {
+        storage,
+        schema,
+        opened: BTreeMap::new(),
+    };
     let mut outcomes = Vec::new();
     let mut owners = BTreeMap::<String, Vec<SyncOperation>>::new();
+    let mut candidates = BTreeMap::<String, Vec<SyncOperation>>::new();
     let mut pending = BTreeMap::<String, Vec<SyncOperation>>::new();
+    let mut versions = BTreeMap::<String, u32>::new();
+    let mut skipped = BTreeSet::new();
     for operation in incoming {
         match PreferencesSyncedEntry::operationPath(operation) {
-            Ok(path) => pending
-                .entry(path.to_owned())
-                .or_default()
-                .push(operation.clone()),
+            Ok(path) => candidates.entry(path.to_owned()).or_default().push(operation.clone()),
             Err(error) => outcomes.push(PreferenceMergeOutcome {
-                paths: BTreeSet::new(),
-                operations: vec![operation.clone()],
+                paths: BTreeSet::new(), operations: vec![operation.clone()], skipped: false,
                 result: Err(format!("op={}: {error}", operation.opId)),
             }),
+        }
+    }
+    for (path, operations) in candidates {
+        let owner = match schema.owner(&path) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => {
+                outcomes.push(PreferenceMergeOutcome {
+                    paths: BTreeSet::from([path]), operations, skipped: true,
+                    result: Ok(BTreeMap::new()),
+                });
+                continue;
+            }
+            Err(error) => {
+                outcomes.push(PreferenceMergeOutcome {
+                    paths: BTreeSet::from([path]), operations, skipped: false, result: Err(error),
+                });
+                continue;
+            }
+        };
+        // A malformed transaction rejects that transaction, not independent operations in its file.
+        let mut decoded = Vec::new();
+        for operation in operations {
+            let entry = PreferencesSyncedEntry::fromOperation(&operation)
+                .map_err(|error| error.to_string())
+                .and_then(|entry| if entry.encrypted() == owner.encrypted { Ok(entry) }
+                    else { Err(format!("Conflicting preference encryption policy: {path}")) });
+            match entry {
+                Ok(entry) => decoded.push((operation, entry)),
+                Err(error) => {
+                    skipped.insert(path.clone());
+                    outcomes.push(PreferenceMergeOutcome {
+                        paths: BTreeSet::from([path.clone()]), operations: vec![operation],
+                        skipped: false, result: Err(error),
+                    });
+                }
+            }
+        }
+        if decoded.is_empty() { continue; }
+        let version = match mergeAttempt(&path, || stores.version(&path, owner.encrypted)) {
+            Ok(version) => version,
+            Err(error) => {
+                skipped.insert(path.clone());
+                outcomes.push(PreferenceMergeOutcome {
+                    paths: BTreeSet::from([path]), operations: decoded.into_iter().map(|(op, _)| op).collect(),
+                    skipped: false, result: Err(error),
+                });
+                continue;
+            }
+        };
+        versions.insert(path.clone(), version);
+        for (operation, entry) in decoded {
+            if entry.schemaVersion().is_none_or(|remote| remote < version) {
+                skipped.insert(path.clone());
+                outcomes.push(PreferenceMergeOutcome {
+                    paths: BTreeSet::from([path.clone()]), operations: vec![operation],
+                    skipped: true, result: Ok(BTreeMap::new()),
+                });
+                continue;
+            }
+            match entry.requireSchemaVersion(version) {
+                Ok(()) => pending.entry(path.clone()).or_default().push(operation),
+                Err(error) => {
+                    skipped.insert(path.clone());
+                    outcomes.push(PreferenceMergeOutcome {
+                        paths: BTreeSet::from([path.clone()]), operations: vec![operation],
+                        skipped: false, result: Err(error.to_string()),
+                    });
+                }
+            }
         }
     }
     // History is committed context, not a request to rematerialize every dataset.
@@ -275,22 +379,30 @@ where
                 entries.iter().any(|entry| entry["key"] == PLUGIN_MERGE_DECLARATION_KEY)
             });
         if declaresMerge {
-            if let Some(path) = operation.payload["storagePath"].as_str() {
-                participating.insert(path.to_owned());
+            if let Ok(entry) = PreferencesSyncedEntry::fromOperation(operation) {
+                if stores.version(entry.storagePath(), entry.encrypted())
+                    .is_ok_and(|version| entry.schemaVersion() == Some(version)) {
+                    participating.insert(entry.storagePath().to_owned());
+                }
             }
         }
     }
+    // A rejected operation cannot trigger preparation or reference projection for its dataset.
+    participating.retain(|path| !skipped.contains(path) || pending.contains_key(path));
     for operation in history
         .iter()
-        .chain(incoming)
+        .chain(pending.values().flatten())
         .filter(|operation| operation.domain == "preferences")
     {
         if let Some(path) = operation.payload.get("storagePath").and_then(Value::as_str)
             .filter(|path| participating.contains(*path)) {
-            owners
-                .entry(path.into())
-                .or_default()
-                .push(operation.clone());
+            let compatible = versions.get(path).copied().or_else(|| {
+                let entry = PreferencesSyncedEntry::fromOperation(operation).ok()?;
+                stores.version(path, entry.encrypted()).ok()
+            }).is_some_and(|version| operation.payload.get("schemaVersion").and_then(Value::as_u64) == Some(u64::from(version)));
+            if compatible {
+                owners.entry(path.into()).or_default().push(operation.clone());
+            }
         }
     }
     for path in participating {
@@ -301,14 +413,9 @@ where
     for (path, history) in owners {
         let operations = pending.remove(&path).unwrap_or_default();
         let index = outcomes.len();
-        let result = applyDeclaredOperations(
-            storage.clone(),
-            schema,
-            &path,
-            &history,
-            &BTreeMap::new(),
-            retain,
-        );
+        let result = mergeAttempt(&path, || applyDeclaredOperations(
+            &mut stores, &path, &history, &BTreeMap::new(), retain,
+        ));
         if let Ok(decisions) = &result {
             aliases.extend(decisions.clone());
             committed.push((index, path.clone(), history));
@@ -316,23 +423,65 @@ where
         outcomes.push(PreferenceMergeOutcome {
             paths: BTreeSet::from([path]),
             operations,
+            skipped: false,
             result,
         });
     }
     // Reference projection uses only alias decisions whose owning dataset has committed.
     if !aliases.is_empty() {
         for (index, path, history) in committed {
-            outcomes[index].result = applyDeclaredOperations(
-                storage.clone(),
-                schema,
-                &path,
-                &history,
-                &aliases,
-                retain,
-            );
+            outcomes[index].result = mergeAttempt(&path, || applyDeclaredOperations(
+                &mut stores, &path, &history, &aliases, retain,
+            ));
         }
     }
     outcomes
+}
+
+/// Owner callbacks may panic; keep the other datasets and the next attempt usable.
+fn mergeAttempt<T>(path: &str, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+        .map_err(|payload| {
+            let detail = payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("non-string panic");
+            format!("Preference merge panicked path={path}: {detail}")
+        })?
+}
+
+/// Reuses each owner's DataStore throughout one batch, including reference projection.
+struct PreferenceStores<'a> {
+    storage: Arc<dyn RuntimeStorageHost>,
+    schema: &'a PreferenceMergeSchema,
+    opened: BTreeMap<String, (bool, PreferencesDataStore)>,
+}
+
+impl PreferenceStores<'_> {
+    /// Opens one store per path while preserving its declared encryption policy.
+    fn open(&mut self, path: &str, encrypted: bool) -> Result<&PreferencesDataStore, String> {
+        let (expected, store) = match self.opened.entry(path.to_owned()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let owner = self.schema.owner(path)?
+                    .ok_or_else(|| format!("Undeclared preference merge owner: {path}"))?;
+                if owner.encrypted != encrypted {
+                    return Err(format!("Conflicting preference encryption policy: {path}"));
+                }
+                let store = (owner.open)(self.storage.clone(), path);
+                entry.insert((encrypted, store))
+            }
+        };
+        if *expected != encrypted {
+            return Err(format!("Conflicting preference encryption policy: {path}"));
+        }
+        Ok(store)
+    }
+
+    /// Checks the replay version without creating a file or committing schema-only state.
+    fn version(&mut self, path: &str, encrypted: bool) -> Result<u32, String> {
+        self.open(path, encrypted)?
+            .syncSchemaVersion()
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Applies all requested datasets while preserving a separate durable commit for each owner.
@@ -389,7 +538,7 @@ fn prepareOwner(
         owner.stores.push(PreferenceMergeStore {
             path,
             encrypted: false,
-            storageVersion: None,
+            open: |storage, path| PreferencesDataStore::newWithStorage(storage, path),
             decode: None,
             merge,
         });
@@ -440,8 +589,7 @@ fn declaredAliases(
 
 /// Replays one dataset and commits its business state, original identities and archive intent together.
 fn applyDeclaredOperations<F>(
-    storage: Arc<dyn RuntimeStorageHost>,
-    schema: &PreferenceMergeSchema,
+    stores: &mut PreferenceStores<'_>,
     path: &str,
     incoming: &[SyncOperation],
     externalAliases: &BTreeMap<String, String>,
@@ -450,6 +598,7 @@ fn applyDeclaredOperations<F>(
 where
     F: Fn(&str, &str) -> bool,
 {
+    let schema = stores.schema;
     validateSchema(&PreferenceMergeSchema {
         stores: schema.stores.iter().filter(|store| store.path == path).cloned().collect(),
     })?;
@@ -457,35 +606,13 @@ where
         Some(operation) => PreferencesSyncedEntry::fromOperation(operation)
             .map_err(|error| error.to_string())?.encrypted(),
         None => match schema.stores.iter().find(|store| store.path == path) {
-            Some(store) if storage.exists(path).map_err(|error| error.to_string())? => store.encrypted,
+            Some(store) if stores.storage.exists(path).map_err(|error| error.to_string())? => store.encrypted,
             _ => return Ok(BTreeMap::new()),
         },
     };
-    PreferencesDataStore::materializeSyncedDataset(storage, path, encrypted, incoming,
-        |preferences, originals| {
-            let Some(store) = schema.stores.iter().find(|store| store.path == path) else { return Ok(()); };
-            let Some(version) = store.storageVersion else { return Ok(()); };
-            let actual = PreferencesDataStore::readSchemaVersion(preferences)?;
-            if actual > version {
-                return Err(PreferencesDataStoreError::SchemaVersionTooNew { actual, expected: version });
-            }
-            if actual < version {
-                if let Some(decode) = store.decode {
-                    let mut legacy = preferences.clone();
-                    // Locally committed current-contract operations already carry typed values.
-                    for operation in originals.iter().filter(|operation| operation.payload["contractVersion"] == 1) {
-                        for key in PreferencesSyncedEntry::fromOperation(operation)?.keys() {
-                            legacy.remove(&stringPreferencesKey(key));
-                        }
-                    }
-                    let mut entry = PreferencesSyncedEntry::storedSnapshot(path, encrypted, &legacy)?;
-                    decode(&mut entry)?;
-                    entry.apply(preferences)?;
-                }
-                preferences.set(&PreferencesDataStore::schemaVersionKey(), version);
-            }
-            Ok(())
-        },
+    let store = stores.open(path, encrypted)?;
+    let version = store.syncSchemaVersion().map_err(|error| error.to_string())?;
+    store.materializeSyncedDataset(version, incoming,
         |preferences, originals, replay| {
         // A committed dataset only needs declarations and alias decisions for reference projection.
         let metadata;
@@ -567,9 +694,6 @@ where
                 }
                 _ => return Err(PreferencesDataStoreError::Message("Projection selection must be an identity or null".into())),
             }
-        }
-        if let Some(version) = schema.stores.first().and_then(|store| store.storageVersion) {
-            preferences.set(&PreferencesDataStore::schemaVersionKey(), version);
         }
         Ok(aliases.clone())
     }).map_err(|error| error.to_string())
