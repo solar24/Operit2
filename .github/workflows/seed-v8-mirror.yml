@@ -1,0 +1,52 @@
+name: Seed Android V8 Mirror
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve pinned V8 version
+        id: v8ver
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib, re
+          lock = pathlib.Path("apps/flutter/native/operit-flutter-bridge/Cargo.lock").read_text()
+          versions = set()
+          for block in lock.split("[[package]]"):
+              if re.search(r'^name = "v8"$', block, re.M):
+                  versions.update(re.findall(r'^version = "([^"]+)"$', block, re.M))
+          if len(versions) != 1:
+              raise SystemExit("expected exactly one V8 version, got %s" % sorted(versions))
+          print("version=" + versions.pop())
+          PY
+
+      - name: Restore Android V8 cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tools/release/work/android-v8
+          key: linux-android-v8-v${{ steps.v8ver.outputs.version }}-ndk27-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Publish V8 to release mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V8_VERSION: ${{ steps.v8ver.outputs.version }}
+        run: |
+          set -uo pipefail
+          test -n "$(find tools/release/work/android-v8 -name librusty_v8.a -print -quit)" || { echo 'no cached V8 to mirror'; exit 1; }
+          asset="android-v8-v${V8_VERSION}-linux.tar.gz"
+          tar -I "gzip -1" -cf "/tmp/$asset" -C tools/release/work/android-v8 .
+          ls -l "/tmp/$asset"
+          if ! gh release view v8-mirror --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create v8-mirror --repo "$GITHUB_REPOSITORY" --title "Android V8 mirror" --notes "Reusable Android V8 static libraries for CI."
+          fi
+          gh release upload v8-mirror "/tmp/$asset" --repo "$GITHUB_REPOSITORY" --clobber
