@@ -257,6 +257,14 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
+      - name: Restore Flutter app build dir
+        uses: actions/cache@v4
+        with:
+          path: apps/flutter/app/build
+          key: appbuild-${ runner.os }-${ hashFiles('apps/flutter/app/pubspec.lock', 'apps/flutter/app/.fvmrc', 'apps/flutter/app/android/app/build.gradle.kts') }
+          restore-keys: |
+            appbuild-${ runner.os }-
+
       - name: Restore Cargo caches
         uses: actions/cache@v4
         with:
@@ -431,6 +439,18 @@ jobs:
             Write-Host "::warning::android build attempt $attempt failed with exit $LASTEXITCODE, retrying in 60s"
             Start-Sleep -Seconds 60
           }
+
+      - name: Stop Gradle daemons
+        shell: pwsh
+        if: always()
+        run: |
+          if (Test-Path apps/flutter/app/android/gradlew.bat) {
+            Push-Location apps/flutter/app/android
+            try { .\gradlew.bat --stop } finally { Pop-Location }
+          }
+          Start-Sleep -Seconds 8
+          Get-Process java -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
 
       - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
