@@ -240,6 +240,8 @@ jobs:
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
       PYTHONUTF8: "1"
+      GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+      GIT_HTTP_LOW_SPEED_TIME: "60"
 
     steps:
       - name: Checkout
@@ -263,6 +265,7 @@ jobs:
             ~/.cargo/git
             apps/flutter/native/operit-flutter-bridge/target/release
             apps/flutter/native/operit-flutter-bridge/target/aarch64-linux-android
+            core/crates/proxy/local/target
           key: cargo-${{ runner.os }}-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
@@ -418,7 +421,16 @@ jobs:
           if ($version.Count -ne 1) {
             throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
           }
-          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+          $attempts = 3
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq $attempts) {
+              throw "android build failed after $attempts attempts (exit $LASTEXITCODE)"
+            }
+            Write-Host "::warning::android build attempt $attempt failed with exit $LASTEXITCODE, retrying in 60s"
+            Start-Sleep -Seconds 60
+          }
 
       - name: Upload Android artifacts
         uses: actions/upload-artifact@v4
