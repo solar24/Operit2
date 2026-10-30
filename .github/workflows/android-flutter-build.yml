@@ -67,7 +67,10 @@ jobs:
 
   build-android-v8:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 180
+
+    permissions:
+      contents: write
 
     defaults:
       run:
@@ -77,7 +80,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve pinned V8 version
+        id: v8ver
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib, re
+          lock = pathlib.Path("apps/flutter/native/operit-flutter-bridge/Cargo.lock").read_text()
+          versions = set()
+          for block in lock.split("[[package]]"):
+              if re.search(r'^name = "v8"$', block, re.M):
+                  versions.update(re.findall(r'^version = "([^"]+)"$', block, re.M))
+          if len(versions) != 1:
+              raise SystemExit("expected exactly one V8 version, got %s" % sorted(versions))
+          print("version=" + versions.pop())
+          PY
+
+      - name: Restore Android V8 cache
+        id: v8cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tools/release/work/android-v8
+          key: linux-android-v8-v${{ steps.v8ver.outputs.version }}-ndk27-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Fetch V8 from release mirror
+        id: v8mirror
+        if: steps.v8cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V8_VERSION: ${{ steps.v8ver.outputs.version }}
+        run: |
+          set -uo pipefail
+          asset="android-v8-v${V8_VERSION}-linux.tar.gz"
+          dest="tools/release/work/android-v8"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          rm -rf /tmp/v8-mirror
+          if gh release download v8-mirror --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir /tmp/v8-mirror 2>/dev/null              && tar -xzf "/tmp/v8-mirror/$asset" -C "$dest"              && test -f "$dest/librusty_v8.a"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "restored $asset from release mirror"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "release mirror unavailable, V8 will be built from source"
+          fi
+
       - name: Install V8 build tools
+        if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -98,12 +146,14 @@ jobs:
             zlib1g-dev
 
       - name: Install Rust
+        if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
           targets: aarch64-linux-android
 
       - name: Install Android NDK 27.3.13750724
+        if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
         run: |
           set -euo pipefail
           ndk_dir="$ANDROID_HOME/ndk/27.3.13750724"
@@ -113,6 +163,7 @@ jobs:
           test -d "$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64"
 
       - name: Install libclang 21 for bindgen
+        if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
@@ -130,13 +181,8 @@ jobs:
           ls /usr/lib/llvm-21/lib/clang/ 2>/dev/null || true
           python3 -c "import ctypes; ctypes.CDLL('/usr/lib/llvm21/lib/libclang.so'); print('libclang loads')"
 
-      - name: Cache Android V8 build dir
-        uses: actions/cache@v4
-        with:
-          path: tools/release/work/android-v8
-          key: linux-android-v8-v152.2.0-ndk27-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
-
       - name: Build Android V8 from source
+        if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
         run: |
           set -euo pipefail
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.3.13750724"
@@ -144,6 +190,38 @@ jobs:
             --target aarch64-linux-android \
             --env-file /tmp/android-v8.env
           cat /tmp/android-v8.env
+
+      - name: Verify restored Android V8 cache
+        if: steps.v8cache.outputs.cache-hit == 'true' || steps.v8mirror.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          test -f tools/release/work/android-v8/librusty_v8.a
+          test -f tools/release/work/android-v8/src_binding.rs
+          test -f tools/release/work/android-v8/args.gn
+          test -f tools/release/work/android-v8/manifest.json
+          ls -l tools/release/work/android-v8
+
+      - name: Publish V8 to release mirror
+        if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V8_VERSION: ${{ steps.v8ver.outputs.version }}
+        run: |
+          set -uo pipefail
+          asset="android-v8-v${V8_VERSION}-linux.tar.gz"
+          rm -f "/tmp/$asset"
+          tar -I "gzip -1" -cf "/tmp/$asset" -C tools/release/work/android-v8 . || exit 0
+          if ! gh release view v8-mirror --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create v8-mirror --repo "$GITHUB_REPOSITORY" --title "Android V8 mirror" --notes "Reusable Android V8 static libraries for CI." || true
+          fi
+          gh release upload v8-mirror "/tmp/$asset" --repo "$GITHUB_REPOSITORY" --clobber || echo "mirror upload skipped"
+
+      - name: Save Android V8 cache
+        if: steps.v8cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: tools/release/work/android-v8
+          key: ${{ steps.v8cache.outputs.cache-primary-key }}
 
       - name: Upload Android V8 cache
         uses: actions/upload-artifact@v4
@@ -166,6 +244,52 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Restore Gradle caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/flutter/app/android/**/*.gradle.kts', 'apps/flutter/app/android/gradle/wrapper/gradle-wrapper.properties', 'apps/flutter/app/pubspec.lock') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Restore Cargo caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/flutter/native/operit-flutter-bridge/target/release
+            apps/flutter/native/operit-flutter-bridge/target/aarch64-linux-android
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Restore Flutter SDK and pub caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/fvm
+            ~/.fvm
+            ~/AppData/Local/fvm
+            ~/AppData/Local/Pub/Cache
+            ~/AppData/Roaming/Pub/Cache
+            ~/.pub-cache
+          key: flutter-${{ runner.os }}-${{ hashFiles('apps/flutter/app/.fvmrc') }}
+          restore-keys: |
+            flutter-${{ runner.os }}-
+
+      - name: Restore pnpm store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/pnpm/store
+            ~/.local/share/pnpm/store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('plugins/packages/buildin/workflow/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
 
       - name: Create plugin sync virtualenv
         shell: pwsh
