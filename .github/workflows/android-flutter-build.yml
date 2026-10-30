@@ -261,9 +261,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: apps/flutter/app/build
-          key: appbuild-${ runner.os }-${ hashFiles('apps/flutter/app/pubspec.lock', 'apps/flutter/app/.fvmrc', 'apps/flutter/app/android/app/build.gradle.kts') }
+          key: appbuild-${{ runner.os }}-${{ hashFiles('apps/flutter/app/pubspec.lock', 'apps/flutter/app/.fvmrc', 'apps/flutter/app/android/app/build.gradle.kts') }}
           restore-keys: |
-            appbuild-${ runner.os }-
+            appbuild-${{ runner.os }}-
 
       - name: Restore Cargo caches
         uses: actions/cache@v4
