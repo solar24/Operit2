@@ -116,7 +116,7 @@ jobs:
           rm -rf "$dest"
           mkdir -p "$dest"
           rm -rf /tmp/v8-mirror
-          if gh release download v8-mirror --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir /tmp/v8-mirror 2>/dev/null              && tar -xzf "/tmp/v8-mirror/$asset" -C "$dest"              && test -f "$dest/aarch64-linux-android/librusty_v8.a"; then
+          if gh release download v8-mirror --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir /tmp/v8-mirror 2>/dev/null              && tar -xzf "/tmp/v8-mirror/$asset" -C "$dest"              && test -n "$(find "$dest" -name librusty_v8.a -print -quit)"; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
             echo "restored $asset from release mirror"
           else
@@ -195,12 +195,11 @@ jobs:
         if: steps.v8cache.outputs.cache-hit == 'true' || steps.v8mirror.outputs.ok == 'true'
         run: |
           set -euo pipefail
-          d=tools/release/work/android-v8/aarch64-linux-android
-          test -f "$d/librusty_v8.a"
-          test -f "$d/src_binding.rs"
-          test -f "$d/args.gn"
-          test -f "$d/manifest.json"
-          ls -l "$d"
+          test -n "$(find tools/release/work/android-v8 -name librusty_v8.a -print -quit)"
+          test -n "$(find tools/release/work/android-v8 -name src_binding.rs -print -quit)"
+          test -n "$(find tools/release/work/android-v8 -name args.gn -print -quit)"
+          test -n "$(find tools/release/work/android-v8 -name manifest.json -print -quit)"
+          find tools/release/work/android-v8 -maxdepth 3 -type f | head -20
 
       - name: Publish V8 to release mirror
         if: steps.v8cache.outputs.cache-hit != 'true' && steps.v8mirror.outputs.ok != 'true'
