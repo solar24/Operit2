@@ -286,8 +286,9 @@ jobs:
             ~/.cargo/git
             apps/flutter/native/operit-flutter-bridge/target/release
             apps/flutter/native/operit-flutter-bridge/target/aarch64-linux-android
-            core/crates/proxy/local/target
-          key: cargo-v2-${{ runner.os }}-${{ hashFiles('core/**/*.rs', 'core/Cargo.lock', 'core/**/Cargo.toml', 'core/**/build.rs', 'apps/flutter/native/operit-flutter-bridge/**/*.rs', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'apps/flutter/native/operit-flutter-bridge/**/build.rs') }}
+            apps/flutter/native/operit-flutter-bridge/target/operit-v8
+            core/target
+          key: cargo-v3-${{ runner.os }}-${{ hashFiles('core/**/*.rs', 'core/Cargo.lock', 'core/**/Cargo.toml', 'core/**/build.rs', 'apps/flutter/native/operit-flutter-bridge/**/*.rs', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'apps/flutter/native/operit-flutter-bridge/**/build.rs') }}
 
       - name: Restore Flutter SDK and pub caches
         uses: actions/cache@v4
@@ -428,6 +429,15 @@ jobs:
         with:
           name: operit2-android-v8-${{ github.sha }}
           path: tools/release/work/android-v8
+
+      - name: Normalize imported V8 timestamps
+        shell: pwsh
+        run: |
+          $ts = [datetime]::SpecifyKind([datetime]'2020-01-01T00:00:00', [System.DateTimeKind]::Utc)
+          $n = 0
+          Get-ChildItem -LiteralPath tools/release/work/android-v8 -Recurse -File -Force |
+            ForEach-Object { $_.LastWriteTimeUtc = $ts; $n++ }
+          Write-Host "normalized $n V8 cache files"
 
       - name: Check build environment
         shell: pwsh
