@@ -242,10 +242,21 @@ jobs:
       PYTHONUTF8: "1"
       GIT_HTTP_LOW_SPEED_LIMIT: "1000"
       GIT_HTTP_LOW_SPEED_TIME: "60"
+      GRADLE_OPTS: -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.workers.max=4 -Dorg.gradle.project.kotlin.incremental=true
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Normalize source timestamps
+        shell: pwsh
+        run: |
+          $ts = [datetime]::SpecifyKind([datetime]'2020-01-01T00:00:00', [System.DateTimeKind]::Utc)
+          $count = 0
+          Get-ChildItem -LiteralPath . -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike '*\.git\*' } |
+            ForEach-Object { $_.LastWriteTimeUtc = $ts; $count++ }
+          Write-Host "normalized $count files to $ts"
 
       - name: Restore Gradle caches
         uses: actions/cache@v4
@@ -253,8 +264,10 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('apps/flutter/app/android/**/*.gradle.kts', 'apps/flutter/app/android/gradle/wrapper/gradle-wrapper.properties', 'apps/flutter/app/pubspec.lock') }}
+            apps/flutter/app/android/.gradle
+          key: gradle-v2-${{ runner.os }}-${{ hashFiles('apps/flutter/app/android/**/*.gradle.kts', 'apps/flutter/app/android/gradle/wrapper/gradle-wrapper.properties', 'apps/flutter/app/pubspec.lock') }}
           restore-keys: |
+            gradle-v2-${{ runner.os }}-
             gradle-${{ runner.os }}-
 
       - name: Restore Flutter app build dir
@@ -274,9 +287,7 @@ jobs:
             apps/flutter/native/operit-flutter-bridge/target/release
             apps/flutter/native/operit-flutter-bridge/target/aarch64-linux-android
             core/crates/proxy/local/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          key: cargo-v2-${{ runner.os }}-${{ hashFiles('core/**/*.rs', 'core/Cargo.lock', 'core/**/Cargo.toml', 'core/**/build.rs', 'apps/flutter/native/operit-flutter-bridge/**/*.rs', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'apps/flutter/native/operit-flutter-bridge/**/build.rs') }}
 
       - name: Restore Flutter SDK and pub caches
         uses: actions/cache@v4
