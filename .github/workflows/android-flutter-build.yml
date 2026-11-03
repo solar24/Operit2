@@ -242,6 +242,9 @@ jobs:
       PYTHONUTF8: "1"
       GIT_HTTP_LOW_SPEED_LIMIT: "1000"
       GIT_HTTP_LOW_SPEED_TIME: "60"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_CACHE_SIZE: 2G
+      SCCACHE_IDLE_TIMEOUT: "0"
       GRADLE_OPTS: -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.workers.max=4 -Dorg.gradle.project.kotlin.incremental=true
 
     steps:
@@ -289,6 +292,19 @@ jobs:
             apps/flutter/native/operit-flutter-bridge/target/operit-v8
             core/target
           key: cargo-v3-${{ runner.os }}-${{ hashFiles('core/**/*.rs', 'core/Cargo.lock', 'core/**/Cargo.toml', 'core/**/build.rs', 'apps/flutter/native/operit-flutter-bridge/**/*.rs', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'apps/flutter/native/operit-flutter-bridge/**/build.rs') }}
+
+      - name: Install sccache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+
+      - name: Restore sccache cache
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/Mozilla/sccache
+          key: sccache-${{ runner.os }}-${{ hashFiles('core/**/*.rs', 'core/Cargo.lock', 'apps/flutter/native/operit-flutter-bridge/**/*.rs', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-
 
       - name: Restore Flutter SDK and pub caches
         uses: actions/cache@v4
@@ -460,6 +476,11 @@ jobs:
             Write-Host "::warning::android build attempt $attempt failed with exit $LASTEXITCODE, retrying in 60s"
             Start-Sleep -Seconds 60
           }
+
+      - name: Show sccache stats
+        if: always()
+        shell: pwsh
+        run: sccache --show-stats
 
       - name: Stop Gradle daemons
         shell: pwsh
