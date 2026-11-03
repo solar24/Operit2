@@ -245,7 +245,6 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_CACHE_SIZE: 2G
       SCCACHE_IDLE_TIMEOUT: "0"
-      GRADLE_OPTS: -Dorg.gradle.caching=true -Dorg.gradle.parallel=true -Dorg.gradle.workers.max=4 -Dorg.gradle.project.kotlin.incremental=true -Dorg.gradle.logging.level=info
 
     steps:
       - name: Checkout
@@ -272,6 +271,17 @@ jobs:
           restore-keys: |
             gradle-v2-${{ runner.os }}-
             gradle-${{ runner.os }}-
+
+      - name: Configure Gradle user properties
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:USERPROFILE ".gradle"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          @"
+          org.gradle.caching=true
+          org.gradle.parallel=true
+          "@ | Set-Content -Path (Join-Path $dir "gradle.properties") -Encoding utf8
+          Get-Content (Join-Path $dir "gradle.properties")
 
       - name: Restore Flutter app build dir
         uses: actions/cache@v4
